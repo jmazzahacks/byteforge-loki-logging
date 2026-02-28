@@ -5,13 +5,7 @@ Python logging library with Grafana Loki integration, async queue-based handler,
 ## Installation
 
 ```bash
-pip install byteforge-loki-logging
-```
-
-Or from GitHub:
-
-```bash
-pip install git+https://github.com/jmazzahacks/byteforge-loki-logging.git@main
+pip install git+https://github.com/jmazzahacks/byteforge-loki-logging.git
 ```
 
 ## Quick Start
