@@ -493,6 +493,14 @@ class TestLokiConnection:
         assert msg == ""
 
     @patch("requests.get")
+    def test_sends_auth_credentials(self, mock_get: MagicMock) -> None:
+        mock_get.return_value = MagicMock(status_code=200, ok=True)
+        _test_loki_connection(self._ENDPOINT, "myuser", "mypass", "/ca.pem")
+        mock_get.assert_called_once()
+        call_kwargs = mock_get.call_args[1]
+        assert call_kwargs["auth"] == ("myuser", "mypass")
+
+    @patch("requests.get")
     def test_non_2xx_returns_failure(self, mock_get: MagicMock) -> None:
         mock_get.return_value = MagicMock(status_code=503, ok=False)
         ok, msg = _test_loki_connection(self._ENDPOINT, "user", "pass", "/ca.pem")
