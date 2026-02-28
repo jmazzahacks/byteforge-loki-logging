@@ -185,6 +185,7 @@ def _test_loki_connection(
         response = requests.get(
             f"{base_url}/ready",
             timeout=3,
+            auth=(user, password),
             verify=ca_bundle if ca_bundle and ca_bundle != "false" else False
         )
 
