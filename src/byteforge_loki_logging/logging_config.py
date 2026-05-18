@@ -10,6 +10,7 @@ from queue import Queue
 from typing import Optional, Set, Tuple, Union
 
 import logging_loki
+from logging.handlers import BufferingHandler
 from logging_loki.handlers import LokiBatchHandler
 
 
@@ -119,25 +120,60 @@ class SafeLokiHandler(logging_loki.LokiHandler):
         print("=" * 60, file=sys.stderr)
 
 
+class SafeLokiBatchHandler(LokiBatchHandler):
+    """LokiBatchHandler that survives `logging.config.dictConfig` calls.
+
+    Stdlib's MemoryHandler.close() — which we inherit through LokiBatchHandler
+    — sets `self.target = None` as part of cleanup. That's fine for one-shot
+    programs, but in long-running services that use logging.config.dictConfig
+    (Flask+gunicorn create_app patterns, FastAPI+uvicorn, etc.), dictConfig
+    calls `_clearExistingHandlers()` which iterates ALL handlers in the
+    module-level `_handlerList` and calls close() on each one. After that,
+    our LokiBatchHandler.target is None, and every subsequent flush() silently
+    does nothing (`if self.target and self.buffer: ...` short-circuits to no-op).
+    Records pile up in self.buffer forever and never reach Loki — no exception,
+    no log line, completely invisible.
+
+    This override flushes any pending records and marks the handler closed,
+    but leaves `self.target` intact so subsequent emits/flushes keep working.
+    See the diagnostic trail in mcp-gatekeeper v0.5.5 for how this manifests
+    in production.
+    """
+
+    def close(self) -> None:
+        try:
+            if self.flushOnClose and self.target:
+                self.flush()
+        finally:
+            self.acquire()
+            try:
+                # Skip MemoryHandler.close() — it would set self.target = None.
+                # Go directly to BufferingHandler.close() which just marks the
+                # handler closed via Handler.close().
+                BufferingHandler.close(self)
+            finally:
+                self.release()
+
+
 class SafeLokiQueueHandler(logging.handlers.QueueHandler):
     """Queue-based Loki handler that sends logs asynchronously via a background thread.
 
     Uses an in-memory queue so that emit() returns in microseconds instead
     of blocking on an HTTP POST to Loki. A QueueListener drains the queue
     in a background thread and forwards records through SafeLokiHandler
-    (optionally wrapped in LokiBatchHandler for batched POSTs).
+    (optionally wrapped in SafeLokiBatchHandler for batched POSTs).
 
     Tracks the number of enqueued messages for diagnostics via get_diagnostics().
     """
 
-    handler: Union[LokiBatchHandler, SafeLokiHandler]
+    handler: Union[SafeLokiBatchHandler, SafeLokiHandler]
 
     def __init__(self, queue: Queue, batch_interval: Optional[float] = None, **kwargs) -> None:
         super().__init__(queue)
         self.enqueued_count: int = 0
         loki_handler = SafeLokiHandler(**kwargs)
         if batch_interval:
-            self.handler = LokiBatchHandler(batch_interval, target=loki_handler)
+            self.handler = SafeLokiBatchHandler(batch_interval, target=loki_handler)
         else:
             self.handler = loki_handler
         self.listener = logging.handlers.QueueListener(self.queue, self.handler)
@@ -304,7 +340,7 @@ def _create_loki_handler(
         formatter = logging.Formatter('%(name)s - %(levelname)s - %(message)s')
 
     inner_handler = handler.handler
-    if isinstance(inner_handler, LokiBatchHandler):
+    if isinstance(inner_handler, LokiBatchHandler):  # SafeLokiBatchHandler is a subclass
         inner_handler.target.setFormatter(formatter)
     else:
         inner_handler.setFormatter(formatter)

@@ -550,3 +550,61 @@ class TestLokiConnection:
         ok, msg = _test_loki_connection(self._ENDPOINT, "user", "pass", "/ca.pem")
         assert ok is False
         assert "Connection timeout" in msg
+
+
+class TestSafeLokiBatchHandlerSurvivesDictConfig:
+    """Regression for the silent-log-drop bug found via mcp-gatekeeper.
+
+    Stdlib's `logging.config.dictConfig` unconditionally calls
+    `_clearExistingHandlers()` which closes every handler in
+    `_handlerList`. Stock `LokiBatchHandler` inherits MemoryHandler.close,
+    which sets `self.target = None` — after that, every subsequent flush()
+    is a no-op and records pile up silently. SafeLokiBatchHandler MUST
+    override close() to preserve target.
+    """
+
+    def test_safe_batch_handler_target_survives_close(self) -> None:
+        """close() must NOT clear target — that's the whole point of the subclass."""
+        import logging
+        from byteforge_loki_logging.logging_config import SafeLokiBatchHandler, SafeLokiHandler
+
+        target = SafeLokiHandler(url="https://example.test/loki/api/v1/push")
+        h = SafeLokiBatchHandler(interval=1.0, target=target)
+        assert h.target is target
+
+        h.close()
+
+        assert h.target is target, (
+            "SafeLokiBatchHandler.close() cleared self.target — that's the upstream "
+            "MemoryHandler.close() behavior we explicitly subclass to prevent."
+        )
+
+    def test_safe_batch_handler_target_survives_dictConfig(self) -> None:
+        """Full path: create handler, simulate uvicorn's dictConfig, verify target intact."""
+        import logging
+        import logging.config
+        from byteforge_loki_logging.logging_config import SafeLokiBatchHandler, SafeLokiHandler
+
+        target = SafeLokiHandler(url="https://example.test/loki/api/v1/push")
+        h = SafeLokiBatchHandler(interval=1.0, target=target)
+        logging.getLogger().addHandler(h)
+
+        try:
+            # Simulate what uvicorn (or any framework) does when given a
+            # log_config — dictConfig non-incrementally calls
+            # _clearExistingHandlers() which closes everything in _handlerList.
+            logging.config.dictConfig({
+                "version": 1,
+                "disable_existing_loggers": False,
+                "loggers": {
+                    "uvicorn": {"handlers": [], "level": "INFO", "propagate": True},
+                },
+            })
+
+            assert h.target is target, (
+                "After dictConfig, SafeLokiBatchHandler.target was cleared — the "
+                "regression has returned. Records would silently pile up in buffer "
+                "and never reach Loki."
+            )
+        finally:
+            logging.getLogger().removeHandler(h)
