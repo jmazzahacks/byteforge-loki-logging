@@ -33,6 +33,19 @@ Set these when running in production (not needed when `debug_local=True`):
 | `LOKI_PASSWORD` | HTTP Basic Auth password |
 | `LOKI_CA_BUNDLE_PATH` | Path to CA `.pem` file, or `"false"` to disable SSL verification |
 
+### `LOKI_ENDPOINT` must be the full push URL
+
+A common deployment mistake is setting `LOKI_ENDPOINT` to the base URL of your
+Loki instance. The library expects the full push API path:
+
+```bash
+# Wrong — log POSTs go to / and silently 404:
+LOKI_ENDPOINT=https://loki.example.com:8443
+
+# Right:
+LOKI_ENDPOINT=https://loki.example.com:8443/loki/api/v1/push
+```
+
 ## Usage
 
 ### Production (Loki)
@@ -63,7 +76,11 @@ Query in Grafana: `{application="my-service"} | json | user_id="123"`
 
 ### Graceful Fallback
 
-If the Loki connection test fails at startup, logging automatically falls back to stdout with a warning on stderr. Your application never crashes due to logging issues.
+If the Loki connection test fails at startup, logging automatically falls back
+to stdout and a loud banner-style warning is printed to stderr (with the
+endpoint, error, and a hint about the `/loki/api/v1/push` path). Your
+application never crashes due to logging issues, but operators are explicitly
+told that logs are not reaching Loki.
 
 ## API
 

@@ -204,6 +204,45 @@ def _test_loki_connection(
         return False, f"Unexpected error: {str(e)}"
 
 
+def _emit_connection_failure_warning(
+    endpoint: str, error_msg: str, application_tag: str
+) -> None:
+    """Print a banner-style warning to stderr when the Loki connection test fails.
+
+    Production operators must notice that logs are not reaching Loki, so the
+    output is deliberately loud and includes the endpoint, error, and a hint
+    about the most common misconfiguration (forgetting the /loki/api/v1/push
+    path suffix). stderr is flushed so the warning isn't lost behind buffering
+    when the process is short-lived or stderr is captured by a container runtime.
+    """
+    print("=" * 70, file=sys.stderr)
+    print("WARNING: byteforge-loki-logging connection test FAILED", file=sys.stderr)
+    print("=" * 70, file=sys.stderr)
+    print(f"  Endpoint:    {endpoint}", file=sys.stderr)
+    print(f"  Error:       {error_msg}", file=sys.stderr)
+    print(f"  Application: {application_tag}", file=sys.stderr)
+    print("", file=sys.stderr)
+    print(
+        "  Falling back to stdout logging. Logs WILL NOT reach Loki.",
+        file=sys.stderr,
+    )
+    print("", file=sys.stderr)
+    print(
+        "  Hint: LOKI_ENDPOINT must be the full push URL, e.g.",
+        file=sys.stderr,
+    )
+    print(
+        "        https://loki.example.com/loki/api/v1/push",
+        file=sys.stderr,
+    )
+    print(
+        "        (not just the base URL https://loki.example.com).",
+        file=sys.stderr,
+    )
+    print("=" * 70, file=sys.stderr)
+    sys.stderr.flush()
+
+
 def _configure_loki_internal_logger() -> None:
     """Configure the loki library's internal error logger to write to stderr.
 
@@ -307,10 +346,15 @@ def configure_logging(
     """Configure logging for the application with Loki integration or local stdout.
 
     Tests the Loki connection before setting up the handler. If the connection
-    test fails, it automatically falls back to stdout logging.
+    test fails, prints a loud banner-style warning to stderr and falls back to
+    stdout logging. The application never crashes due to logging issues, but
+    operators are explicitly told that logs are not reaching Loki.
 
     Environment variables (required when debug_local=False):
-        LOKI_ENDPOINT: Loki push API URL (e.g. https://loki.example.com/loki/api/v1/push)
+        LOKI_ENDPOINT: Loki push API URL — must be the full push path,
+            e.g. https://loki.example.com/loki/api/v1/push (not just the
+            base URL). The base URL alone may pass the /ready probe but
+            log POSTs will silently 404.
         LOKI_USER: HTTP Basic Auth username
         LOKI_PASSWORD: HTTP Basic Auth password
         LOKI_CA_BUNDLE_PATH: Path to CA .pem file, or "false" to disable SSL verification
@@ -340,11 +384,7 @@ def configure_logging(
     connection_ok, error_msg = _test_loki_connection(endpoint, user, password, ca_bundle_path)
 
     if not connection_ok:
-        print(f"WARNING: Loki connection test failed: {error_msg}", file=sys.stderr)
-        print(
-            f"WARNING: Falling back to stdout logging for application: {application_tag}",
-            file=sys.stderr,
-        )
+        _emit_connection_failure_warning(endpoint, error_msg, application_tag)
         _configure_stdout_logging(local_level)
         return None
 

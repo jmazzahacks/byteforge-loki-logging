@@ -375,6 +375,26 @@ class TestConfigureLogging:
         assert len(root.handlers) == 1
         assert isinstance(root.handlers[0], logging.StreamHandler)
 
+    @patch("byteforge_loki_logging.logging_config._test_loki_connection",
+           return_value=(False, "Loki /ready returned HTTP 404"))
+    def test_failed_connection_emits_loud_banner_warning(self, mock_conn: MagicMock) -> None:
+        captured = StringIO()
+        with patch.dict("os.environ", _env_vars(), clear=True), patch("sys.stderr", captured):
+            configure_logging("probe")
+
+        output = captured.getvalue()
+        # Banner separator must be present so the warning stands out in container logs.
+        assert "=" * 70 in output
+        assert "connection test FAILED" in output
+        # Operator needs to see the endpoint that was tried, the error, and which app is affected.
+        assert _env_vars()["LOKI_ENDPOINT"] in output
+        assert "HTTP 404" in output
+        assert "probe" in output
+        # Stdout-fallback warning must be explicit, not buried.
+        assert "WILL NOT reach Loki" in output
+        # Hint about the most common misconfig (forgetting the push path).
+        assert "/loki/api/v1/push" in output
+
     @patch("byteforge_loki_logging.logging_config._test_loki_connection", return_value=(True, ""))
     @patch("byteforge_loki_logging.logging_config.logging_loki.LokiHandler.__init__", return_value=None)
     def test_successful_connection_creates_queue_handler(
