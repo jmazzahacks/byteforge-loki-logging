@@ -82,6 +82,28 @@ endpoint, error, and a hint about the `/loki/api/v1/push` path). Your
 application never crashes due to logging issues, but operators are explicitly
 told that logs are not reaching Loki.
 
+### Short-Lived Processes (CLI / cron jobs)
+
+The async queue means a process can exit before the background listener has
+POSTed the last enqueued records, silently dropping the final log lines.
+`configure_logging()` auto-registers a flush via `atexit` when a Loki handler
+is installed, so most scripts get correct behavior with no code change. For
+explicit, bounded shutdown — e.g. from a `finally` block — call
+`flush_logging()`:
+
+```python
+from byteforge_loki_logging import configure_logging, flush_logging
+
+configure_logging(application_tag="refresh-asn-table")
+try:
+    do_work()
+finally:
+    flush_logging(timeout=5.0)   # blocks until drained, or returns False on timeout
+```
+
+`flush_logging()` is idempotent and a no-op when no Loki handler is configured
+(e.g. `debug_local=True`).
+
 ## API
 
 ### `configure_logging(application_tag, debug_local=False, local_level=logging.INFO, json_format=True)`
@@ -94,6 +116,17 @@ told that logs are not reaching Loki.
 | `json_format` | `bool` | `True` | Use JSON formatting for structured queries |
 
 Returns `SafeLokiQueueHandler` on success, `None` on fallback/local mode.
+
+### `flush_logging(timeout=5.0)`
+
+Drains the async queue and flushes every Loki handler on the root logger.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `timeout` | `float` | `5.0` | Max seconds to wait for the drain (so a dead Loki can't hang exit) |
+
+Returns `True` if fully flushed in time (or if no Loki handler is configured),
+`False` on timeout. Safe to call multiple times and from `atexit`.
 
 ## License
 

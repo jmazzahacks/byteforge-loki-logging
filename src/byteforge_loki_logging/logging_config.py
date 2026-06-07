@@ -1,17 +1,22 @@
 # logging_config.py
+import atexit
 import json
 import logging
 import logging.handlers
 import os
 import sys
+import threading
 import time
 import traceback
 from queue import Queue
-from typing import Optional, Set, Tuple, Union
+from typing import List, Optional, Set, Tuple, Union
 
 import logging_loki
 from logging.handlers import BufferingHandler
 from logging_loki.handlers import LokiBatchHandler
+
+
+_atexit_registered = False
 
 
 # Standard LogRecord attributes that should not be treated as extra fields
@@ -197,6 +202,75 @@ class SafeLokiQueueHandler(logging.handlers.QueueHandler):
 
     def __del__(self) -> None:
         self.listener.stop()
+
+
+def _collect_loki_queue_handlers() -> List[SafeLokiQueueHandler]:
+    """Return every SafeLokiQueueHandler currently attached to the root logger."""
+    return [
+        h for h in logging.getLogger().handlers
+        if isinstance(h, SafeLokiQueueHandler)
+    ]
+
+
+def flush_logging(timeout: float = 5.0) -> bool:
+    """Drain the async queue and flush every Loki handler on the root logger.
+
+    Short-lived processes (CLI tools, cron jobs) can exit before the
+    background QueueListener thread POSTs the last enqueued records,
+    silently dropping the final log lines — exactly the success/failure
+    summaries operators need to see. Call this at the end of such programs
+    to force a clean drain.
+
+    Args:
+        timeout: Maximum seconds to wait for the drain to complete. Bounded
+            so a dead Loki endpoint can't hang process exit.
+
+    Returns:
+        True if all handlers were fully flushed within `timeout`, or if
+        there was nothing to flush (no Loki handler installed, e.g.
+        debug_local=True or stdout fallback). False if the timeout elapsed
+        before the drain finished.
+
+    Safe to call multiple times — once the listener has been stopped,
+    subsequent calls return quickly. configure_logging() also registers
+    this as an atexit handler when a Loki handler is installed, so most
+    scripts get correct behavior with no code change.
+    """
+    handlers = _collect_loki_queue_handlers()
+    if not handlers:
+        return True
+
+    completed = threading.Event()
+
+    def _drain() -> None:
+        for h in handlers:
+            try:
+                h.listener.stop()
+            except Exception:
+                pass
+            try:
+                h.flush()
+            except Exception:
+                pass
+        completed.set()
+
+    worker = threading.Thread(target=_drain, daemon=True)
+    worker.start()
+    return completed.wait(timeout)
+
+
+def _register_atexit_flush() -> None:
+    """Register flush_logging as an atexit handler exactly once per process.
+
+    Guarded by a module-level flag so repeat configure_logging() calls
+    (e.g. in tests, or apps that reconfigure on signal) don't stack
+    duplicate atexit entries.
+    """
+    global _atexit_registered
+    if _atexit_registered:
+        return
+    atexit.register(flush_logging)
+    _atexit_registered = True
 
 
 def _test_loki_connection(
@@ -434,5 +508,6 @@ def configure_logging(
     root_logger.addHandler(handler)
 
     _configure_loki_internal_logger()
+    _register_atexit_flush()
 
     return handler

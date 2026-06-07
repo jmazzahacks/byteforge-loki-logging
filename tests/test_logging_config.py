@@ -2,6 +2,7 @@ import json
 import logging
 import logging.handlers
 import sys
+import threading
 from io import StringIO
 from queue import Queue
 from typing import Any
@@ -9,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import byteforge_loki_logging.logging_config as cfg_module
 from byteforge_loki_logging.logging_config import (
     LokiJsonFormatter,
     SafeLokiHandler,
@@ -17,6 +19,7 @@ from byteforge_loki_logging.logging_config import (
     _test_loki_connection,
     _configure_loki_internal_logger,
     configure_logging,
+    flush_logging,
     _STANDARD_RECORD_ATTRS,
 )
 
@@ -608,3 +611,122 @@ class TestSafeLokiBatchHandlerSurvivesDictConfig:
             )
         finally:
             logging.getLogger().removeHandler(h)
+
+
+# ===========================================================================
+# flush_logging — public flush / graceful-shutdown helper
+# ===========================================================================
+
+class TestFlushLogging:
+
+    def setup_method(self) -> None:
+        root = logging.getLogger()
+        root.handlers.clear()
+        root.setLevel(logging.WARNING)
+        # Each test starts as if configure_logging had never registered atexit,
+        # so the registration assertions below see a clean slate.
+        cfg_module._atexit_registered = False
+
+    def test_returns_true_when_no_handlers_installed(self) -> None:
+        assert flush_logging() is True
+
+    def test_returns_true_when_only_non_loki_handlers_present(self) -> None:
+        logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
+        assert flush_logging() is True
+
+    @patch("byteforge_loki_logging.logging_config.logging_loki.LokiHandler.__init__", return_value=None)
+    def test_stops_listener_and_calls_flush(self, mock_init: MagicMock) -> None:
+        handler = SafeLokiQueueHandler(Queue(-1), url="http://loki", tags={}, auth=("u", "p"))
+        logging.getLogger().addHandler(handler)
+        try:
+            stop_spy = MagicMock(wraps=handler.listener.stop)
+            handler.listener.stop = stop_spy
+            flush_spy = MagicMock(wraps=handler.flush)
+            handler.flush = flush_spy
+
+            assert flush_logging(timeout=2.0) is True
+            stop_spy.assert_called_once()
+            flush_spy.assert_called_once()
+        finally:
+            logging.getLogger().removeHandler(handler)
+            try:
+                handler.listener.stop()
+            except Exception:
+                pass
+
+    @patch("byteforge_loki_logging.logging_config.logging_loki.LokiHandler.__init__", return_value=None)
+    def test_is_idempotent(self, mock_init: MagicMock) -> None:
+        handler = SafeLokiQueueHandler(Queue(-1), url="http://loki", tags={}, auth=("u", "p"))
+        logging.getLogger().addHandler(handler)
+        try:
+            assert flush_logging(timeout=2.0) is True
+            # Second invocation must not raise even though the listener is stopped.
+            assert flush_logging(timeout=2.0) is True
+        finally:
+            logging.getLogger().removeHandler(handler)
+
+    def test_returns_false_when_drain_exceeds_timeout(self) -> None:
+        # Stand-in handler whose listener.stop() blocks forever — simulates a
+        # dead Loki endpoint hanging the final POST. flush_logging must bound
+        # this with its timeout and return False rather than hang on exit.
+        slow_handler = MagicMock(spec=SafeLokiQueueHandler)
+        block_forever = threading.Event()
+        slow_handler.listener = MagicMock()
+        slow_handler.listener.stop = MagicMock(side_effect=lambda: block_forever.wait())
+        slow_handler.flush = MagicMock()
+
+        with patch(
+            "byteforge_loki_logging.logging_config._collect_loki_queue_handlers",
+            return_value=[slow_handler],
+        ):
+            assert flush_logging(timeout=0.1) is False
+        block_forever.set()  # let the daemon worker thread unblock
+
+    @patch("byteforge_loki_logging.logging_config._test_loki_connection", return_value=(True, ""))
+    @patch("byteforge_loki_logging.logging_config.logging_loki.LokiHandler.__init__", return_value=None)
+    @patch("byteforge_loki_logging.logging_config.atexit.register")
+    def test_configure_logging_registers_atexit_when_loki_active(
+        self, mock_register: MagicMock, mock_init: MagicMock, mock_conn: MagicMock
+    ) -> None:
+        with patch.dict("os.environ", _env_vars(), clear=True):
+            result = configure_logging("myapp")
+        try:
+            mock_register.assert_called_once_with(flush_logging)
+        finally:
+            if result and hasattr(result, "listener"):
+                result.listener.stop()
+
+    @patch("byteforge_loki_logging.logging_config._test_loki_connection", return_value=(True, ""))
+    @patch("byteforge_loki_logging.logging_config.logging_loki.LokiHandler.__init__", return_value=None)
+    @patch("byteforge_loki_logging.logging_config.atexit.register")
+    def test_configure_logging_atexit_registers_only_once(
+        self, mock_register: MagicMock, mock_init: MagicMock, mock_conn: MagicMock
+    ) -> None:
+        results = []
+        try:
+            with patch.dict("os.environ", _env_vars(), clear=True):
+                results.append(configure_logging("myapp"))
+                results.append(configure_logging("myapp"))
+            assert mock_register.call_count == 1
+        finally:
+            for r in results:
+                if r and hasattr(r, "listener"):
+                    r.listener.stop()
+
+    @patch("byteforge_loki_logging.logging_config.atexit.register")
+    def test_configure_logging_does_not_register_atexit_for_debug_local(
+        self, mock_register: MagicMock
+    ) -> None:
+        configure_logging("myapp", debug_local=True)
+        mock_register.assert_not_called()
+
+    @patch("byteforge_loki_logging.logging_config._test_loki_connection",
+           return_value=(False, "Loki /ready returned HTTP 404"))
+    @patch("byteforge_loki_logging.logging_config.atexit.register")
+    def test_configure_logging_does_not_register_atexit_on_fallback(
+        self, mock_register: MagicMock, mock_conn: MagicMock
+    ) -> None:
+        captured = StringIO()
+        with patch.dict("os.environ", _env_vars(), clear=True), patch("sys.stderr", captured):
+            configure_logging("myapp")
+        mock_register.assert_not_called()
