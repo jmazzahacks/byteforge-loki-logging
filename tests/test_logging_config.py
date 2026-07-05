@@ -3,6 +3,7 @@ import logging
 import logging.handlers
 import sys
 import threading
+import time
 from io import StringIO
 from queue import Queue
 from typing import Any
@@ -10,9 +11,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from logging_loki.handlers import LokiBatchHandler
+
 import byteforge_loki_logging.logging_config as cfg_module
 from byteforge_loki_logging.logging_config import (
     LokiJsonFormatter,
+    SafeLokiBatchHandler,
     SafeLokiHandler,
     SafeLokiQueueHandler,
     _resolve_log_level,
@@ -466,6 +470,65 @@ class TestConfigureLogging:
 
     @patch("byteforge_loki_logging.logging_config._test_loki_connection", return_value=(True, ""))
     @patch("byteforge_loki_logging.logging_config.logging_loki.LokiHandler.__init__", return_value=None)
+    def test_default_batch_interval_uses_batch_handler(
+        self, mock_init: MagicMock, mock_conn: MagicMock
+    ) -> None:
+        with patch.dict("os.environ", _env_vars(), clear=True):
+            result = configure_logging("myapp")
+        try:
+            assert isinstance(result.handler, SafeLokiBatchHandler)
+        finally:
+            if result and hasattr(result, "listener"):
+                result.listener.stop()
+                result.handler.stop_timer()
+
+    @patch("byteforge_loki_logging.logging_config._test_loki_connection", return_value=(True, ""))
+    @patch("byteforge_loki_logging.logging_config.logging_loki.LokiHandler.__init__", return_value=None)
+    def test_batch_interval_none_ships_immediately_without_batching(
+        self, mock_init: MagicMock, mock_conn: MagicMock
+    ) -> None:
+        with patch.dict("os.environ", _env_vars(), clear=True):
+            result = configure_logging("myapp", batch_interval=None)
+        try:
+            # No batch layer at all — records go straight to SafeLokiHandler.
+            assert isinstance(result.handler, SafeLokiHandler)
+            assert not isinstance(result.handler, LokiBatchHandler)
+        finally:
+            if result and hasattr(result, "listener"):
+                result.listener.stop()
+
+    @patch("byteforge_loki_logging.logging_config._test_loki_connection", return_value=(True, ""))
+    @patch("byteforge_loki_logging.logging_config.logging_loki.LokiHandler.__init__", return_value=None)
+    def test_reconfigure_stops_previous_handler_threads(
+        self, mock_init: MagicMock, mock_conn: MagicMock
+    ) -> None:
+        # A second configure_logging() must not orphan the first handler's
+        # QueueListener + batch-flush timer threads — they must be stopped, not
+        # left running until GC.
+        with patch.dict("os.environ", _env_vars(), clear=True):
+            first = configure_logging("app-v1")
+            first_listener_thread = first.listener._thread
+            first_timer = first.handler._flush_timer
+            assert first_listener_thread.is_alive()
+            assert first_timer.is_alive()
+
+            second = configure_logging("app-v2")
+        try:
+            first_listener_thread.join(timeout=1.0)
+            first_timer.join(timeout=1.0)
+            assert not first_listener_thread.is_alive()
+            assert not first_timer.is_alive()
+            assert second in logging.getLogger().handlers
+        finally:
+            if second and hasattr(second, "listener"):
+                try:
+                    second.listener.stop()
+                except Exception:
+                    pass
+                second.handler.stop_timer()
+
+    @patch("byteforge_loki_logging.logging_config._test_loki_connection", return_value=(True, ""))
+    @patch("byteforge_loki_logging.logging_config.logging_loki.LokiHandler.__init__", return_value=None)
     def test_string_log_level_resolved(
         self, mock_init: MagicMock, mock_conn: MagicMock
     ) -> None:
@@ -573,14 +636,17 @@ class TestSafeLokiBatchHandlerSurvivesDictConfig:
 
         target = SafeLokiHandler(url="https://example.test/loki/api/v1/push")
         h = SafeLokiBatchHandler(interval=1.0, target=target)
-        assert h.target is target
+        try:
+            assert h.target is target
 
-        h.close()
+            h.close()
 
-        assert h.target is target, (
-            "SafeLokiBatchHandler.close() cleared self.target — that's the upstream "
-            "MemoryHandler.close() behavior we explicitly subclass to prevent."
-        )
+            assert h.target is target, (
+                "SafeLokiBatchHandler.close() cleared self.target — that's the upstream "
+                "MemoryHandler.close() behavior we explicitly subclass to prevent."
+            )
+        finally:
+            h.stop_timer()
 
     def test_safe_batch_handler_target_survives_dictConfig(self) -> None:
         """Full path: create handler, simulate uvicorn's dictConfig, verify target intact."""
@@ -611,6 +677,69 @@ class TestSafeLokiBatchHandlerSurvivesDictConfig:
             )
         finally:
             logging.getLogger().removeHandler(h)
+            h.stop_timer()
+
+
+# ===========================================================================
+# SafeLokiBatchHandler — background flush timer
+# ===========================================================================
+
+class TestSafeLokiBatchHandlerPeriodicFlush:
+    """Regression for the stranded-trailing-records bug (idle bursty services).
+
+    Stock MemoryHandler flushes only inside emit(), so the last record(s) of a
+    burst sit in the buffer until the next emit — minutes later, or never, in a
+    long-running idle service. SafeLokiBatchHandler MUST flush on a wall-clock
+    timer so trailing records ship on their own.
+    """
+
+    def test_timer_flushes_buffered_records_without_a_later_emit(self) -> None:
+        # The whole point: records already in the buffer must reach the target
+        # on the timer alone, with NO subsequent emit() to trigger shouldFlush.
+        shipped: list = []
+        target = MagicMock()
+        target.emit_batch.side_effect = lambda buf: shipped.extend(buf)
+
+        h = SafeLokiBatchHandler(interval=0.1, target=target)
+        try:
+            h.buffer.append(_make_record(msg="STRANDED", args=()))
+            # Wait up to ~2s for a timer tick to flush it. No emit() in between.
+            for _ in range(40):
+                if shipped:
+                    break
+                time.sleep(0.05)
+            assert len(shipped) == 1
+            assert shipped[0].getMessage() == "STRANDED"
+        finally:
+            h.stop_timer()
+
+    def test_stop_timer_halts_the_flush_thread(self) -> None:
+        target = MagicMock()
+        h = SafeLokiBatchHandler(interval=0.1, target=target)
+        assert h._flush_timer.is_alive()
+
+        h.stop_timer()
+        h._flush_timer.join(timeout=1.0)
+        assert not h._flush_timer.is_alive()
+
+    def test_close_does_not_stop_the_timer(self) -> None:
+        # dictConfig close()s handlers while the process keeps running; the
+        # timer must survive close() or the bug returns after any dictConfig.
+        target = SafeLokiHandler(url="https://example.test/loki/api/v1/push")
+        h = SafeLokiBatchHandler(interval=0.1, target=target)
+        try:
+            h.close()
+            assert h._flush_timer.is_alive()
+        finally:
+            h.stop_timer()
+
+    @pytest.mark.parametrize("bad_interval", [0, 0.0, -1.0, None])
+    def test_non_positive_interval_raises_rather_than_spinning(self, bad_interval: Any) -> None:
+        # interval=0 would hot-spin wait(0); interval=None would block forever
+        # (no flush). Both must fail loud, not silently misbehave.
+        target = SafeLokiHandler(url="https://example.test/loki/api/v1/push")
+        with pytest.raises(ValueError, match="interval must be > 0"):
+            SafeLokiBatchHandler(interval=bad_interval, target=target)
 
 
 # ===========================================================================
@@ -653,6 +782,23 @@ class TestFlushLogging:
                 handler.listener.stop()
             except Exception:
                 pass
+
+    @patch("byteforge_loki_logging.logging_config.logging_loki.LokiHandler.__init__", return_value=None)
+    def test_stops_batch_flush_timer(self, mock_init: MagicMock) -> None:
+        # A clean shutdown must also stop the batch handler's flush timer, not
+        # just the queue listener — otherwise a daemon thread keeps ticking.
+        handler = SafeLokiQueueHandler(
+            Queue(-1), batch_interval=0.1, url="http://loki", tags={}, auth=("u", "p")
+        )
+        logging.getLogger().addHandler(handler)
+        try:
+            assert handler.handler._flush_timer.is_alive()
+            assert flush_logging(timeout=2.0) is True
+            handler.handler._flush_timer.join(timeout=1.0)
+            assert not handler.handler._flush_timer.is_alive()
+        finally:
+            logging.getLogger().removeHandler(handler)
+            handler.handler.stop_timer()
 
     @patch("byteforge_loki_logging.logging_config.logging_loki.LokiHandler.__init__", return_value=None)
     def test_is_idempotent(self, mock_init: MagicMock) -> None:
@@ -711,7 +857,15 @@ class TestFlushLogging:
         finally:
             for r in results:
                 if r and hasattr(r, "listener"):
-                    r.listener.stop()
+                    # The first handler is already stopped by the second
+                    # configure_logging (reconfigure drains old handlers), so
+                    # stop() may double-fire — swallow it.
+                    try:
+                        r.listener.stop()
+                    except Exception:
+                        pass
+                    if isinstance(r.handler, SafeLokiBatchHandler):
+                        r.handler.stop_timer()
 
     @patch("byteforge_loki_logging.logging_config.atexit.register")
     def test_configure_logging_does_not_register_atexit_for_debug_local(

@@ -126,24 +126,77 @@ class SafeLokiHandler(logging_loki.LokiHandler):
 
 
 class SafeLokiBatchHandler(LokiBatchHandler):
-    """LokiBatchHandler that survives `logging.config.dictConfig` calls.
+    """LokiBatchHandler that flushes on a real timer and survives dictConfig.
 
-    Stdlib's MemoryHandler.close() — which we inherit through LokiBatchHandler
-    — sets `self.target = None` as part of cleanup. That's fine for one-shot
-    programs, but in long-running services that use logging.config.dictConfig
-    (Flask+gunicorn create_app patterns, FastAPI+uvicorn, etc.), dictConfig
-    calls `_clearExistingHandlers()` which iterates ALL handlers in the
-    module-level `_handlerList` and calls close() on each one. After that,
-    our LokiBatchHandler.target is None, and every subsequent flush() silently
-    does nothing (`if self.target and self.buffer: ...` short-circuits to no-op).
-    Records pile up in self.buffer forever and never reach Loki — no exception,
-    no log line, completely invisible.
+    Fixes two silent-log-drop failures in stdlib's MemoryHandler (our
+    grandparent), both of which strand records in the buffer with no
+    exception, no log line, completely invisible:
 
-    This override flushes any pending records and marks the handler closed,
-    but leaves `self.target` intact so subsequent emits/flushes keep working.
-    See the diagnostic trail in mcp-gatekeeper v0.5.5 for how this manifests
-    in production.
+    1. No wall-clock flush. MemoryHandler only flushes inside emit(): each
+       record is appended and shouldFlush() is checked *against that record*.
+       There is no background timer, so "1-second batching" really means
+       "flush on the next emit >=1s after the last flush." In a long-running
+       service that logs in occasional bursts (an idle alerting/ingest API),
+       the trailing records of each burst sit in the buffer until the *next*
+       emit — minutes later, or never if the service stays idle. This class
+       runs a daemon thread that calls flush() every `interval` seconds, so
+       the batch interval is an actual wall-clock interval. The atexit
+       flush_logging() safety net does not help here: a gunicorn worker never
+       exits under normal operation, so it never fires.
+
+    2. close() nulling the target. MemoryHandler.close() sets
+       `self.target = None`. In services that use logging.config.dictConfig
+       (Flask+gunicorn create_app patterns, FastAPI+uvicorn, etc.), dictConfig
+       calls `_clearExistingHandlers()` which close()s ALL handlers in the
+       module-level `_handlerList`. After that, target is None and every
+       flush() short-circuits to a no-op forever. The close() override below
+       flushes pending records and marks the handler closed but leaves
+       `self.target` intact so subsequent emits/flushes keep working. Note it
+       deliberately does NOT stop the flush timer — dictConfig close()s the
+       handler while the process keeps running, so the timer must survive too.
+       See the diagnostic trail in mcp-gatekeeper v0.5.5 for how this
+       manifests in production.
     """
+
+    def __init__(self, interval: float, **kwargs) -> None:
+        if interval is None or interval <= 0:
+            # wait(0) would hot-spin the timer thread; wait(None) would block it
+            # forever (reintroducing the stranded-records bug). Batching needs a
+            # real positive interval — to turn batching OFF, pass
+            # batch_interval=None to configure_logging(), which skips this class
+            # entirely and ships each record through SafeLokiHandler.
+            raise ValueError(
+                f"SafeLokiBatchHandler interval must be > 0, got {interval!r}; "
+                "pass batch_interval=None to configure_logging() to disable batching."
+            )
+        super().__init__(interval, **kwargs)
+        self._timer_stop = threading.Event()
+        self._flush_timer = threading.Thread(
+            target=self._periodic_flush,
+            name="loki-batch-flush",
+            daemon=True,
+        )
+        self._flush_timer.start()
+
+    def _periodic_flush(self) -> None:
+        """Flush buffered records every `interval` seconds until stopped.
+
+        Event.wait() returns True the moment stop_timer() sets the event, and
+        False on each `interval` timeout — so this loops on the wall clock and
+        exits promptly on shutdown. flush() is a no-op when the buffer is empty,
+        so idle intervals are cheap.
+        """
+        while not self._timer_stop.wait(self.interval):
+            try:
+                self.flush()
+            except Exception:
+                # flush failures surface via SafeLokiHandler.handleError /
+                # the waylay.loglog logger; never let the timer thread die.
+                pass
+
+    def stop_timer(self) -> None:
+        """Stop the background flush timer. Idempotent and safe after close()."""
+        self._timer_stop.set()
 
     def close(self) -> None:
         try:
@@ -201,7 +254,13 @@ class SafeLokiQueueHandler(logging.handlers.QueueHandler):
         self.handler.flush()
 
     def __del__(self) -> None:
-        self.listener.stop()
+        try:
+            self.listener.stop()
+        except Exception:
+            pass
+        inner = getattr(self, "handler", None)
+        if isinstance(inner, SafeLokiBatchHandler):
+            inner.stop_timer()
 
 
 def _collect_loki_queue_handlers() -> List[SafeLokiQueueHandler]:
@@ -248,6 +307,12 @@ def flush_logging(timeout: float = 5.0) -> bool:
                 h.listener.stop()
             except Exception:
                 pass
+            inner = getattr(h, "handler", None)
+            if isinstance(inner, SafeLokiBatchHandler):
+                try:
+                    inner.stop_timer()
+                except Exception:
+                    pass
             try:
                 h.flush()
             except Exception:
@@ -397,11 +462,12 @@ def _create_loki_handler(
     password: str,
     ca_bundle_path: str,
     json_format: bool,
+    batch_interval: Optional[float],
 ) -> SafeLokiQueueHandler:
     """Create an async queue-based Loki handler with the appropriate formatter."""
     handler = SafeLokiQueueHandler(
         Queue(-1),
-        batch_interval=1.0,
+        batch_interval=batch_interval,
         url=endpoint,
         tags={"application": application_tag},
         auth=(user, password),
@@ -451,7 +517,8 @@ def configure_logging(
     application_tag: str,
     debug_local: bool = False,
     local_level: Union[int, str] = logging.INFO,
-    json_format: bool = True
+    json_format: bool = True,
+    batch_interval: Optional[float] = 1.0
 ) -> Optional[logging.Handler]:
     """Configure logging for the application with Loki integration or local stdout.
 
@@ -474,6 +541,12 @@ def configure_logging(
         debug_local: If True, log to stdout instead of Loki (default: False)
         local_level: Logging level for both Loki and local modes (default: logging.INFO)
         json_format: If True, format Loki logs as JSON for structured queries (default: True)
+        batch_interval: Seconds between batched POSTs to Loki (default: 1.0). A
+            background timer flushes the buffer every `batch_interval` seconds,
+            so trailing records ship on the wall clock even when the process
+            goes idle. Pass None or 0 to disable batching entirely and ship each
+            record immediately — useful for low-volume alerting/ingest services
+            where latency matters more than POST count.
 
     Returns:
         SafeLokiQueueHandler if Loki connection succeeds, None if using stdout fallback
@@ -484,6 +557,13 @@ def configure_logging(
     """
     if not application_tag:
         raise ValueError("application_tag must be set")
+
+    # Reconfigure (SIGHUP, per-worker init, tests) may replace an existing Loki
+    # handler. Clearing root.handlers alone would orphan the previous handler's
+    # QueueListener thread and batch-flush timer — they'd linger until GC. Drain
+    # and stop them first; flush_logging bounds this with its own timeout so a
+    # dead old endpoint can't hang startup, and it's a no-op on first call.
+    flush_logging()
 
     if debug_local:
         _configure_stdout_logging(local_level)
@@ -499,7 +579,7 @@ def configure_logging(
         return None
 
     handler = _create_loki_handler(
-        application_tag, endpoint, user, password, ca_bundle_path, json_format
+        application_tag, endpoint, user, password, ca_bundle_path, json_format, batch_interval
     )
 
     root_logger = logging.getLogger()

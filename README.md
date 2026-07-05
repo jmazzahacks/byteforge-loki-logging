@@ -54,7 +54,17 @@ LOKI_ENDPOINT=https://loki.example.com:8443/loki/api/v1/push
 configure_logging(application_tag="my-service")
 ```
 
-Requires all four environment variables. Logs are sent asynchronously via a background thread with 1-second batching.
+Requires all four environment variables. Logs are sent asynchronously via a
+background thread. Records are batched and POSTed to Loki on a real wall-clock
+timer (every `batch_interval` seconds, default `1.0`), so trailing records ship
+even when the process goes idle between bursts.
+
+For low-volume alerting or ingest services where per-record latency matters more
+than POST count, disable batching so each record ships immediately:
+
+```python
+configure_logging(application_tag="my-service", batch_interval=None)
+```
 
 ### Local Development
 
@@ -106,7 +116,7 @@ finally:
 
 ## API
 
-### `configure_logging(application_tag, debug_local=False, local_level=logging.INFO, json_format=True)`
+### `configure_logging(application_tag, debug_local=False, local_level=logging.INFO, json_format=True, batch_interval=1.0)`
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -114,6 +124,7 @@ finally:
 | `debug_local` | `bool` | `False` | Log to stdout instead of Loki |
 | `local_level` | `int \| str` | `logging.INFO` | Logging level (e.g. `logging.DEBUG`, `"WARNING"`) |
 | `json_format` | `bool` | `True` | Use JSON formatting for structured queries |
+| `batch_interval` | `float \| None` | `1.0` | Seconds between batched POSTs, flushed on a background timer. `None`/`0` disables batching (ship each record immediately) |
 
 Returns `SafeLokiQueueHandler` on success, `None` on fallback/local mode.
 

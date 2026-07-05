@@ -6,5 +6,5 @@ from byteforge_loki_logging.logging_config import (
     LokiJsonFormatter,
 )
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 __all__ = ["configure_logging", "flush_logging", "LokiJsonFormatter"]
