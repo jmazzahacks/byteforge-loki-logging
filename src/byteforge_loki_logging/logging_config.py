@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import traceback
+import weakref
 from queue import Queue
 from typing import Any, List, Optional, Set, Tuple, Union
 
@@ -16,45 +17,62 @@ import requests  # type: ignore[import-untyped]
 from logging.handlers import BufferingHandler
 from logging_loki.emitter import LokiEmitter  # type: ignore[import-untyped]
 from logging_loki.handlers import LokiBatchHandler
-from requests.adapters import HTTPAdapter  # type: ignore[import-untyped]
-from urllib3.util.retry import Retry
 
 
 _atexit_registered = False
+
+#: Every SafeLokiEmitter alive in this process, so a fork can reset them.
+#: Weak so an emitter belonging to a discarded handler is not kept alive.
+_LIVE_EMITTERS: "weakref.WeakSet[SafeLokiEmitter]" = weakref.WeakSet()
+
+
+def _reset_emitters_after_fork() -> None:
+    """Rebuild per-process emitter state in a freshly forked child.
+
+    The PID-keyed session in SafeLokiEmitter.session handles the inherited
+    socket, but it is never reached if the emitter's LOCK is inherited held:
+    logging_loki guards its entry points with @with_lock, which does a
+    non-blocking acquire and RETURNS WITHOUT POSTING when it fails. Fork copies
+    the lock in whatever state it was in, and the thread that owned it does not
+    exist in the child, so a fork that lands while the flush timer is mid-POST
+    leaves the child silently discarding every batch forever. threading's own
+    after-fork fixup does not cover it, because the lock belongs to the emitter
+    rather than to a logging Handler.
+    """
+    for emitter in list(_LIVE_EMITTERS):
+        emitter._lock = threading.Lock()
+        emitter._session = None
+        emitter._session_pid = None
+
+
+if hasattr(os, "register_at_fork"):      # not available on Windows
+    os.register_at_fork(after_in_child=_reset_emitters_after_fork)
 
 #: Seconds any single POST to Loki may take before it is abandoned. Bounded
 #: because logging_loki passes no timeout at all (see SafeLokiEmitter).
 DEFAULT_PUSH_TIMEOUT = 10.0
 
-#: One retry for a push that died on a connection the server had already closed.
+#: Retry a push exactly once when the connection was dropped before we got a
+#: response. Deliberately hand-rolled rather than a urllib3 Retry adapter, and
+#: the reason is worth keeping: urllib3 wraps `RemoteDisconnected` into
+#: `ProtocolError`, which `Retry._is_read_error` counts as a READ error, not a
+#: connect error. So the intuitive `Retry(connect=1, read=0)` does NOT retry a
+#: dropped socket (measured), while the `read=1` that does *also* retries read
+#: TIMEOUTS — which doubles the time a black-holed endpoint takes to report
+#: (see SafeLokiEmitter's push_timeout) and is the case where the server most
+#: plausibly did process the batch, so retrying risks duplicates.
 #:
-#: `read=1` is load-bearing and is NOT the obvious setting. urllib3 wraps
-#: `RemoteDisconnected` into `ProtocolError` (connectionpool.py), and
-#: `Retry._is_read_error` counts `ProtocolError` as a READ error, not a connect
-#: error — so the intuitive `connect=1, read=0` (safe-looking, because a read
-#: error can mean the server already processed the request) declines to retry
-#: exactly the failure we are here to fix. Measured against a server that drops
-#: a pooled keep-alive socket without responding: `connect=1, read=0` fails,
-#: `read=1` recovers.
+#: requests separates the two for us: a dropped connection raises
+#: ConnectionError, a slow one raises ReadTimeout. Retrying only the former is
+#: both cheaper and safer, since a server that hung up without answering never
+#: sent a response and most likely never committed the batch.
 #:
-#: The idempotency cost is real but small: a retried batch could be delivered
-#: twice if the server processed the first attempt and then dropped the socket.
-#: Loki drops exact duplicates (same stream labels, same ns timestamp, same
-#: line), and our payload is byte-identical on retry because timestamps come
-#: from `record.created`, not from send time. Duplicate log lines would in any
-#: case be a better failure than the silently dropped batch this replaces.
-#: (A caller passing replace_timestamp=True to logging_loki gives up that
-#: dedup property — we never do.)
-_PUSH_RETRY_POLICY = Retry(
-    total=1,
-    connect=1,
-    read=1,
-    redirect=0,
-    status=0,
-    backoff_factor=0,
-    allowed_methods=frozenset(["POST"]),
-    raise_on_status=False,
-)
+#: The exclusion below is not redundant: ConnectTimeout subclasses BOTH
+#: ConnectionError and Timeout, so catching ConnectionError alone would retry a
+#: firewall-black-holed endpoint (SYN dropped, no SYN-ACK) and spend a second
+#: full push_timeout on it — the very wedge push_timeout exists to bound.
+_RETRYABLE_PUSH_ERROR = requests.exceptions.ConnectionError
+_NON_RETRYABLE_PUSH_ERROR = requests.exceptions.Timeout
 
 
 # Standard LogRecord attributes that should not be treated as extra fields
@@ -141,30 +159,29 @@ class SafeLokiEmitter(LokiEmitter):
     #: leaves the inherited attribute untyped for the session property below.
     _session: Optional[requests.Session]
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        _LIVE_EMITTERS.add(self)
+
     @property
     def session(self) -> requests.Session:
-        """Return a session that is retry-capable and belongs to THIS process.
+        """Return the cached session, rebuilding it if it belongs to another PID.
 
-        Two fixes over the upstream property, both for RemoteDisconnected bursts
-        seen on hyperopt-server (ticket ac3c6ccd):
+        requests.Session and urllib3's pools are not fork-safe: os.fork()
+        duplicates the descriptor, so children of a process that has already
+        pushed inherit a session pointing at a LIVE socket and all of them send
+        and recv on it at once. The result is protocol chaos and a simultaneous
+        RemoteDisconnected in every child — the reported signature was 16
+        failures inside ~15ms, one per multiprocessing worker in an Optuna pool
+        (ticket ac3c6ccd). Keying the session to the PID is the same guard
+        psycopg2, SQLAlchemy and boto3 use.
 
-        1. Mounts a one-shot retry. Upstream mounts no HTTPAdapter, so
-           max_retries is 0 and a POST onto a pooled socket the server closed
-           while idle (nginx keepalive_timeout) fails outright, losing that
-           batch. urllib3 already discards a *cleanly* FIN-ed socket, so the
-           failure is the race: the socket still looks alive when urllib3 checks
-           it, the request goes out, and only then does the server hang up. One
-           retry opens a fresh connection. See _PUSH_RETRY_POLICY for why
-           `read=1` rather than the safer-looking `read=0`.
+        _reset_emitters_after_fork covers the case this cannot: an emitter lock
+        inherited in the held state, which stops us ever reaching this property.
 
-        2. Keys the cached session to the PID. requests.Session/urllib3 pools
-           are not fork-safe: os.fork() duplicates the descriptor, so children
-           of a process that has already pushed inherit a session pointing at a
-           LIVE socket and all of them send and recv on it at once. The result
-           is protocol chaos and a simultaneous RemoteDisconnected in every
-           child — the reported signature was 16 failures inside ~15ms, one per
-           multiprocessing worker in an Optuna pool. Rebuilding per PID is the
-           same guard psycopg2, SQLAlchemy and boto3 use.
+        The other half of that ticket — retrying a dropped connection — is in
+        _post_to_loki, and no retry adapter is mounted here; see
+        _RETRYABLE_PUSH_ERROR for why that is deliberate.
         """
         pid = os.getpid()
         if self._session is not None and self._session_pid == pid:
@@ -181,15 +198,36 @@ class SafeLokiEmitter(LokiEmitter):
         session = self.session_class()
         session.auth = self.auth or None
         session.verify = self.verify
-        adapter = HTTPAdapter(max_retries=_PUSH_RETRY_POLICY)
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
         self._session = session
         self._session_pid = pid
         return session
 
     def _post_to_loki(self, payload: dict) -> None:
-        """POST the payload with a bounded timeout (see class docstring)."""
+        """POST the payload, retrying once if the connection was dropped.
+
+        The retry covers the reported RemoteDisconnected bursts: a pooled
+        keep-alive socket that the server closes as the request goes out. Note
+        urllib3 already discards a socket that was closed *cleanly* while idle,
+        so this is not "the connection went stale" — it is the race where the
+        socket still looks alive when urllib3 checks it, the request is written,
+        and only then does the server hang up. Without a retry that batch is
+        simply lost.
+
+        Timeouts are deliberately NOT retried — see _RETRYABLE_PUSH_ERROR.
+        """
+        try:
+            self._post_once(payload)
+        except _RETRYABLE_PUSH_ERROR as exc:
+            if isinstance(exc, _NON_RETRYABLE_PUSH_ERROR):
+                # ConnectTimeout is both. See _RETRYABLE_PUSH_ERROR.
+                raise
+            # Drop the pool so the retry gets a genuinely fresh connection
+            # rather than the socket that just failed.
+            self.close()
+            self._post_once(payload)
+
+    def _post_once(self, payload: dict) -> None:
+        """One POST attempt, bounded by push_timeout."""
         self.post_attempts += 1
         resp = self.session.post(
             self.url, json=payload, headers=self.headers, timeout=self.push_timeout
@@ -251,6 +289,9 @@ class SafeLokiHandler(logging_loki.LokiHandler):
         if isinstance(emitter, LokiEmitter):
             emitter.__class__ = SafeLokiEmitter
             emitter.push_timeout = push_timeout
+            # Re-blessing skips SafeLokiEmitter.__init__, so enrol it by hand
+            # for the after-fork reset.
+            _LIVE_EMITTERS.add(emitter)
         elif emitter is not None and sys.meta_path is not None:
             # Failing open here would silently restore unbounded POSTs — the exact
             # wedge this class exists to prevent, and one that produces no output

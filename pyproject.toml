@@ -29,6 +29,10 @@ classifiers = [
 
 dependencies = [
     "python-logging-loki @ git+https://github.com/waylayio/python-logging-loki.git",
+    # Imported at module scope (the push path and the /ready connection test).
+    # It arrives transitively via python-logging-loki today, but relying on that
+    # would make `import byteforge_loki_logging` fail outright if that changed.
+    "requests>=2.25.0",
 ]
 
 [project.optional-dependencies]

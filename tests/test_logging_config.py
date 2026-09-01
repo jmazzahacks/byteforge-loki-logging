@@ -1262,28 +1262,84 @@ class TestStaleSocketRetry:
             # Pre-fix this raised ConnectionError(RemoteDisconnected) and the
             # whole batch was lost.
             emitter._post_to_loki({"streams": []})
-            assert emitter.post_attempts == 2
+            # 3 POSTs on the wire: the first push, the one the server dropped,
+            # and the retry that succeeded on a fresh connection.
+            assert emitter.post_attempts == 3
         finally:
             shutdown()
 
-    def test_retry_policy_treats_the_drop_as_a_read_error(self) -> None:
-        """Guards the non-obvious setting. urllib3 wraps RemoteDisconnected in
-        ProtocolError, which Retry._is_read_error counts as a READ error — so
-        the intuitive connect=1/read=0 declines the retry we need. Measured:
-        read=0 fails, read=1 recovers."""
-        from urllib3.exceptions import ProtocolError
+    def test_a_timeout_is_not_retried(self) -> None:
+        """Load-bearing, and the reason the retry is hand-rolled rather than a
+        urllib3 Retry adapter. The `read=1` needed to retry a dropped socket
+        ALSO retries timeouts, which doubles how long a black-holed endpoint
+        takes to report (v0.1.6's whole point was bounding that) and is the
+        case where the server most plausibly did process the batch."""
+        import requests
 
-        from byteforge_loki_logging.logging_config import _PUSH_RETRY_POLICY
+        emitter = SafeLokiEmitter("http://loki.test/loki/api/v1/push")
+        session = MagicMock()
+        session.post.side_effect = requests.exceptions.ReadTimeout("too slow")
+        emitter._session = session
+        emitter._session_pid = os.getpid()
 
-        assert _PUSH_RETRY_POLICY._is_read_error(ProtocolError("Connection aborted."))
-        assert _PUSH_RETRY_POLICY.read == 1, "read=0 would not retry a dropped socket"
-        assert _PUSH_RETRY_POLICY.total == 1, "one retry only — pushes are not idempotent"
+        with pytest.raises(requests.exceptions.ReadTimeout):
+            emitter._post_to_loki({"streams": []})
 
-    def test_session_mounts_the_retry_adapter_on_both_schemes(self) -> None:
-        emitter = SafeLokiEmitter("https://loki.test/loki/api/v1/push")
-        session = emitter.session
-        for scheme in ("http://", "https://"):
-            assert session.adapters[scheme].max_retries.read == 1
+        assert session.post.call_count == 1, "a timeout must cost one push_timeout, not two"
+
+    def test_a_connect_timeout_is_not_retried(self) -> None:
+        """ConnectTimeout subclasses BOTH ConnectionError and Timeout, so
+        catching ConnectionError alone would retry a firewall-black-holed
+        endpoint (SYN dropped) and burn a second full push_timeout — the wedge
+        push_timeout exists to bound."""
+        import requests
+
+        assert issubclass(requests.exceptions.ConnectTimeout,
+                          requests.exceptions.ConnectionError)
+
+        emitter = SafeLokiEmitter("http://loki.test/loki/api/v1/push")
+        session = MagicMock()
+        session.post.side_effect = requests.exceptions.ConnectTimeout("no SYN-ACK")
+        emitter.session_class = MagicMock(return_value=session)
+        emitter._session = session
+        emitter._session_pid = os.getpid()
+
+        with pytest.raises(requests.exceptions.ConnectTimeout):
+            emitter._post_to_loki({"streams": []})
+
+        assert session.post.call_count == 1
+
+    def test_a_dropped_connection_is_retried_exactly_once(self) -> None:
+        import requests
+
+        emitter = SafeLokiEmitter("http://loki.test/loki/api/v1/push")
+        session = MagicMock()
+        session.post.side_effect = requests.exceptions.ConnectionError("aborted")
+        # The retry drops the pool and rebuilds, so the factory must hand back
+        # the same mock for the second attempt to be observable.
+        emitter.session_class = MagicMock(return_value=session)
+        emitter._session = session
+        emitter._session_pid = os.getpid()
+
+        with pytest.raises(requests.exceptions.ConnectionError):
+            emitter._post_to_loki({"streams": []})
+
+        # One retry, not a retry storm: the second failure propagates.
+        assert session.post.call_count == 2
+        assert emitter.post_attempts == 2
+
+    def test_an_http_error_status_is_not_retried(self) -> None:
+        """A 4xx/5xx means the server answered — resending would duplicate."""
+        emitter = SafeLokiEmitter("http://loki.test/loki/api/v1/push")
+        session = MagicMock()
+        session.post.return_value = MagicMock(status_code=503)
+        emitter._session = session
+        emitter._session_pid = os.getpid()
+
+        with pytest.raises(ValueError, match="503"):
+            emitter._post_to_loki({"streams": []})
+
+        assert session.post.call_count == 1
 
 
 class TestSessionIsForkSafe:
@@ -1304,11 +1360,45 @@ class TestSessionIsForkSafe:
         assert second is not first
         assert emitter._session_pid == os.getpid()
 
+    def test_after_fork_hook_rebuilds_a_held_emitter_lock(self) -> None:
+        """The PID guard is unreachable if the emitter's lock is inherited HELD:
+        logging_loki's @with_lock does a non-blocking acquire and returns
+        WITHOUT posting when it fails, so a fork landing while the flush timer
+        is mid-POST would leave the child silently discarding every batch
+        forever. threading's own after-fork fixup does not cover this lock."""
+        from byteforge_loki_logging.logging_config import _reset_emitters_after_fork
+
+        emitter = SafeLokiEmitter("http://loki.test/loki/api/v1/push")
+        emitter.session  # populate the cache, as a parent that has pushed would
+        emitter._lock.acquire()          # simulate: forked mid-POST
+        assert not emitter._lock.acquire(blocking=False)
+
+        _reset_emitters_after_fork()
+
+        assert emitter._lock.acquire(blocking=False), "child would never post again"
+        emitter._lock.release()
+        assert emitter._session is None
+        assert emitter._session_pid is None
+
+    def test_emitters_are_enrolled_for_the_after_fork_reset(self) -> None:
+        """Including one produced by SafeLokiHandler's re-blessing, which skips
+        SafeLokiEmitter.__init__."""
+        from byteforge_loki_logging.logging_config import _LIVE_EMITTERS
+
+        direct = SafeLokiEmitter("http://loki.test/loki/api/v1/push")
+        handler = SafeLokiHandler(url="http://loki.test/loki/api/v1/push")
+
+        assert direct in _LIVE_EMITTERS
+        assert handler.emitter in _LIVE_EMITTERS
+
     @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork")
     @pytest.mark.filterwarnings("ignore:This process.*is multi-threaded:DeprecationWarning")
     def test_forked_child_does_not_share_the_parent_session(self) -> None:
         emitter = SafeLokiEmitter("https://loki.test/loki/api/v1/push")
-        parent_session_id = id(emitter.session)
+        # Hold the object, and compare with `is` rather than id(): the child
+        # drops its inherited reference, CPython frees it, and the replacement
+        # can land on the same address — an id() check reports a false "shared".
+        parent_session = emitter.session
 
         read_fd, write_fd = os.pipe()
         pid = os.fork()
@@ -1316,7 +1406,7 @@ class TestSessionIsForkSafe:
             # Child: touch the property only — no network, so this stays a test
             # of the fork guard rather than of the platform's fork/TLS quirks.
             os.close(read_fd)
-            shares = id(emitter.session) == parent_session_id
+            shares = emitter.session is parent_session
             owned = emitter._session_pid == os.getpid()
             os.write(write_fd, f"{int(shares)}{int(owned)}".encode())
             os._exit(0)

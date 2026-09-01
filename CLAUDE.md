@@ -49,14 +49,19 @@ logger.emit()
 The four `Safe*` subclasses each exist to fix a specific, silent production failure. Do not "simplify"
 them away without understanding the failure each prevents (all documented in their docstrings):
 
-- **`SafeLokiEmitter`** — overrides two things. (a) `session`, to mount a one-shot retry adapter and
-  to key the cached session to `os.getpid()`. The retry covers a pooled socket the server drops
-  mid-request (urllib3 already discards a *cleanly* closed one, so the real failure is that race);
-  `_PUSH_RETRY_POLICY` uses `read=1` because urllib3 wraps `RemoteDisconnected` in `ProtocolError`,
-  which `Retry._is_read_error` counts as a **read** error — the intuitive `connect=1, read=0` was
-  measured to NOT retry it. The PID key exists because `requests.Session` is not fork-safe: children
-  of a process that has pushed inherit a live socket and race on it, one `RemoteDisconnected` per
-  child (ticket `ac3c6ccd`). (b) `_post_to_loki`, to pass a `timeout` to `session.post()`.
+- **`SafeLokiEmitter`** — overrides two things (both from ticket `ac3c6ccd`). (a) `session`, to key
+  the cached session to `os.getpid()`, because `requests.Session` is not fork-safe: children of a
+  process that has already pushed inherit a live socket and race on it, producing one
+  `RemoteDisconnected` per child. (b) `_post_to_loki`, to bound each attempt with `push_timeout` and
+  to retry **once** when the connection was dropped before a response arrived.
+
+  The retry is hand-rolled rather than a urllib3 `Retry` adapter, and that is deliberate: urllib3
+  wraps `RemoteDisconnected` in `ProtocolError`, which `Retry._is_read_error` counts as a **read**
+  error, so the intuitive `Retry(connect=1, read=0)` was measured NOT to retry it — while the
+  `read=1` that does *also* retries read timeouts, doubling the time a black-holed endpoint takes to
+  report and risking duplicates in the case where the server most plausibly did commit the batch.
+  `requests` separates them for us (dropped → `ConnectionError`, slow → `ReadTimeout`), so we retry
+  only `_RETRYABLE_PUSH_ERROR`. Do not "simplify" this back into a Retry adapter.
   `logging_loki` passes none, so a black-holed endpoint (accepts the connection, never answers) parks
   the flush timer thread in that POST **forever** while it holds the batch handler's lock; the
   QueueListener then blocks on the same lock and the process never ships another line, with no

@@ -150,7 +150,12 @@ library guards against:
 problem is the race: the socket still looks alive when it is checked, the request
 goes out, and only then does the server hang up — surfacing as
 `RemoteDisconnected('Remote end closed connection without response')` and losing
-that batch. Pushes now carry a one-shot retry that opens a fresh connection.
+that batch. A dropped connection is now retried once on a fresh connection.
+
+Timeouts and HTTP error statuses are deliberately *not* retried. Both mean the
+server may well have processed the batch, so a resend risks duplicates — and
+retrying a timeout would double how long a dead endpoint takes to report, which
+`push_timeout` exists to bound.
 
 **Forked children.** `requests.Session` and urllib3's connection pools are not
 fork-safe. A process that has already pushed to Loki and then forks (a
@@ -160,10 +165,21 @@ pointing at the *same* live socket, and they race on it — one simultaneous
 it, so each process transparently gets its own on first use after a fork. This
 is the same guard psycopg2, SQLAlchemy and boto3 use.
 
-Both are automatic; there is nothing to configure. Note the retry means a batch
-could in principle be delivered twice if the server processed it and then dropped
-the socket — Loki drops exact duplicates, and duplicate log lines beat the
-silently lost batch this replaces.
+Both are automatic; there is nothing to configure. The retry means a batch could
+in principle be delivered twice if the server processed it and then dropped the
+socket before answering — Loki drops exact duplicates, and duplicate log lines
+beat the silently lost batch this replaces.
+
+**A forked child still needs its own `configure_logging()`.** The fork guard
+stops children corrupting each other's connections; it does not make logging
+work in a child on its own. The background queue listener is a thread, and
+threads do not survive `os.fork()` — so a child that inherits the handler
+enqueues records that nothing ever drains, and they are lost silently (a
+`flush_logging()` in the child does not help: it stops an already-dead listener
+and flushes an empty buffer). If your workers need to log, call
+`configure_logging()` inside the child; it clears the inherited handlers and
+starts a fresh listener. Workers that only compute and return results need
+nothing.
 
 ### Short-Lived Processes (CLI / cron jobs)
 
