@@ -9,14 +9,19 @@ import threading
 import time
 import traceback
 from queue import Queue
-from typing import List, Optional, Set, Tuple, Union
+from typing import Any, List, Optional, Set, Tuple, Union
 
 import logging_loki
 from logging.handlers import BufferingHandler
+from logging_loki.emitter import LokiEmitter  # type: ignore[import-untyped]
 from logging_loki.handlers import LokiBatchHandler
 
 
 _atexit_registered = False
+
+#: Seconds any single POST to Loki may take before it is abandoned. Bounded
+#: because logging_loki passes no timeout at all (see SafeLokiEmitter).
+DEFAULT_PUSH_TIMEOUT = 10.0
 
 
 # Standard LogRecord attributes that should not be treated as extra fields
@@ -69,12 +74,183 @@ class LokiJsonFormatter(logging.Formatter):
         return json.dumps(log_data)
 
 
+class SafeLokiEmitter(LokiEmitter):
+    """LokiEmitter that bounds every POST with a timeout.
+
+    logging_loki's LokiEmitter._post_to_loki calls session.post() with no
+    `timeout` argument, so requests waits forever. A Loki endpoint that accepts
+    the connection and then never answers (black-holed DNS/route, a hung proxy,
+    an endpoint cut over mid-flight) therefore parks the caller in that POST
+    permanently.
+
+    That is fatal here rather than merely slow, because the flush timer thread
+    holds this handler's lock while it POSTs: once it hangs, the QueueListener
+    thread blocks on the same lock, the queue grows without bound, and the
+    process never ships another log line — with no exception raised anywhere,
+    so nothing is printed and nothing recovers short of a restart. Reproduced
+    against a black-holing test server: 21 records enqueued, 0 delivered, 0
+    bytes on stderr, permanent.
+    """
+
+    push_timeout: float = DEFAULT_PUSH_TIMEOUT
+
+    #: Incremented on every POST actually attempted. Upstream wraps the emitter
+    #: entry points in @with_lock, which returns WITHOUT posting when the lock is
+    #: held, so "emit_batch() did not raise" does not mean "the batch was sent".
+    #: SafeLokiHandler compares this across a call to tell the two apart, rather
+    #: than scoring a silently-skipped push as a delivery.
+    post_attempts: int = 0
+
+    def _post_to_loki(self, payload: dict) -> None:
+        """POST the payload with a bounded timeout (see class docstring)."""
+        self.post_attempts += 1
+        resp = self.session.post(
+            self.url, json=payload, headers=self.headers, timeout=self.push_timeout
+        )
+        if resp.status_code != self.success_response_code:
+            raise ValueError(
+                f"Unexpected Loki API response status code: {resp.status_code}"
+            )
+
+
 class SafeLokiHandler(logging_loki.LokiHandler):
     """LokiHandler wrapper that prevents recursive logging loops.
 
     Overrides handleError to print errors directly to stderr instead of using
     the logging system, which would cause infinite recursion.
+
+    Also makes steady-state push failures visible and recoverable. Upstream
+    LokiHandler.emit_batch catches every exception and calls handleError, after
+    which LokiBatchHandler.flush() clears the buffer regardless — so a failing
+    push silently discards its records. This subclass counts failures, prints a
+    rate-limited banner naming how many records were lost, and closes the
+    emitter session so the next attempt reconnects instead of reusing a socket
+    that may itself be the problem.
     """
+
+    #: Delivery counters, declared at class level so they read correctly even on
+    #: an instance whose __init__ was bypassed (logging internals and tests both
+    #: build handlers that way).
+    consecutive_failures: int = 0
+    push_success_count: int = 0
+    records_dropped: int = 0
+
+    def __init__(
+        self,
+        *args: Any,
+        push_timeout: float = DEFAULT_PUSH_TIMEOUT,
+        **kwargs: Any,
+    ) -> None:
+        """Build the handler, then bound its emitter's POSTs with push_timeout.
+
+        push_timeout is keyword-only and *args is forwarded verbatim, so the
+        inherited LokiHandler(url, tags, ...) positional signature keeps working
+        rather than silently binding the URL to push_timeout.
+        """
+        if push_timeout <= 0:
+            raise ValueError(
+                f"push_timeout must be > 0, got {push_timeout!r}; an unbounded "
+                "POST can wedge the logging pipeline permanently."
+            )
+        super().__init__(*args, **kwargs)
+        self.consecutive_failures = 0
+        self.push_success_count = 0
+        self.records_dropped = 0
+        # LokiHandler builds its own LokiEmitter from a long positional
+        # signature that upstream keeps extending. Re-blessing the instance
+        # applies the timeout without duplicating (and having to track) that
+        # signature here.
+        emitter = getattr(self, "emitter", None)
+        if isinstance(emitter, LokiEmitter):
+            emitter.__class__ = SafeLokiEmitter
+            emitter.push_timeout = push_timeout
+        elif emitter is not None and sys.meta_path is not None:
+            # Failing open here would silently restore unbounded POSTs — the exact
+            # wedge this class exists to prevent, and one that produces no output
+            # of its own. Say so loudly rather than pass.
+            print(
+                "LOKI HANDLER WARNING: could not apply push_timeout — logging_loki "
+                f"supplied a {type(emitter).__name__}, not a LokiEmitter. POSTs to "
+                "Loki are UNBOUNDED and a hung endpoint can stop log delivery for "
+                "the life of this process.",
+                file=sys.stderr,
+            )
+
+    def _note_push_success(self) -> None:
+        """Record a delivered push and clear the failure streak."""
+        self.push_success_count += 1
+        self.consecutive_failures = 0
+
+    def _should_report_failure(self) -> bool:
+        """Report the 1st, 2nd, 4th, 8th ... consecutive failure.
+
+        A wedged endpoint fails on every flush — once per batch_interval, and
+        once per process in a multiprocess service. Printing a full banner each
+        time buries real errors (16 tracebacks per Optuna pool startup was a
+        reported complaint). Backing off on powers of two keeps the first
+        failure immediate and the ongoing signal alive but quiet.
+        """
+        n = self.consecutive_failures
+        return n > 0 and (n & (n - 1)) == 0
+
+    def _note_push_failure(self, records_lost: int) -> None:
+        """Count a failed push and drop the HTTP session so the next one reconnects.
+
+        Accounting only — it prints nothing, so the two failure paths can each
+        report in their own shape without doubling up on banners.
+        """
+        self.consecutive_failures += 1
+        self.records_dropped += records_lost
+        # Reconnect on the next attempt: the pooled socket may be the fault
+        # (stale keep-alive, endpoint cut over). Upstream did this and our
+        # earlier handleError override dropped it, which is why a wedged
+        # handler never recovered without a container restart.
+        try:
+            self.emitter.close()
+        except Exception:
+            pass
+
+    def _report_batch_failure(self, records_lost: int, reason: str = "") -> None:
+        """Print a loud, rate-limited banner for a failed batch push to Loki."""
+        if not self._should_report_failure():
+            return
+        if sys.meta_path is None:
+            return
+
+        print("=" * 60, file=sys.stderr)
+        print("LOKI HANDLER ERROR: Failed to send log batch to Loki", file=sys.stderr)
+        print("=" * 60, file=sys.stderr)
+        if reason:
+            print(reason, file=sys.stderr)
+        print(f"Records dropped this batch: {records_lost}", file=sys.stderr)
+        print(
+            f"Consecutive failed pushes: {self.consecutive_failures} "
+            f"(total records dropped: {self.records_dropped})",
+            file=sys.stderr,
+        )
+        if self.push_success_count == 0:
+            print(
+                "This handler has NEVER successfully delivered a batch. Logs are "
+                "not reaching Loki at all — check LOKI_ENDPOINT is the full push "
+                "URL (.../loki/api/v1/push), and check credentials.",
+                file=sys.stderr,
+            )
+        elif self.consecutive_failures >= 4:
+            print(
+                "Loki delivery has been failing repeatedly. Logs queried from "
+                "Loki for this service are INCOMPLETE for this period.",
+                file=sys.stderr,
+            )
+        try:
+            ei = sys.exc_info()
+            if ei and ei[0]:
+                print(f"\nError Type: {ei[0].__name__}", file=sys.stderr)
+                print(f"Error Message: {ei[1]}", file=sys.stderr)
+                print("\nFull Traceback:", file=sys.stderr)
+                traceback.print_exception(*ei, file=sys.stderr)
+        except Exception as e:
+            print(f"Could not print exception info: {e}", file=sys.stderr)
+        print("=" * 60, file=sys.stderr)
 
     def emit(self, record: logging.LogRecord) -> None:
         """Send log record to Loki.
@@ -84,15 +260,83 @@ class SafeLokiHandler(logging_loki.LokiHandler):
         the original log message.
         """
         try:
-            self.emitter(record, self.format(record))
+            line = self.format(record)
         except Exception:
+            # A formatter bug is not a Loki outage: report it, but do not count
+            # it against delivery or tear down a healthy HTTP session.
             self.handleError(record)
+            return
 
-    def handleError(self, record: logging.LogRecord) -> None:
+        try:
+            self.emitter(record, line)
+        except Exception:
+            self._note_push_failure(1)
+            # handleError prints this path's banner, so reporting here as well
+            # would double every message. Gate it on the same backoff the batch
+            # path uses: with batching off, an unreachable endpoint would
+            # otherwise print a full banner and traceback per log line.
+            if self._should_report_failure():
+                self.handleError(record)
+        else:
+            self._note_push_success()
+
+    def emit_batch(self, records: List[logging.LogRecord]) -> None:
+        """Send a batch of records, reporting failures instead of swallowing them.
+
+        Upstream's emit_batch routes the exception into handleError and returns
+        normally, so LokiBatchHandler.flush() clears the buffer and the loss is
+        invisible. Here the failure is counted and announced.
+
+        Deliberately NOT wrapped in logging_loki's @with_original_stdout, unlike
+        the method it overrides. That decorator pins output to the stderr that
+        existed at logging_loki import time, so the banner bypasses any later
+        redirect — including the one an operator or test harness installed to
+        capture it. Our reporting never re-enters the logging system (it is a
+        raw print), so the recursion guard it provides buys nothing here, and
+        emit()/handleError already honour the live sys.stderr.
+        """
+        try:
+            batch = [(record, self.format(record)) for record in records]
+        except Exception:
+            # A formatter bug is not a Loki outage (see emit). An empty batch
+            # cannot raise here, so records[0] is always present.
+            self.handleError(records[0])
+            return
+
+        # @with_lock returns without posting when the emitter is busy, so a clean
+        # return does not prove delivery. Only SafeLokiEmitter counts attempts;
+        # against any other emitter fall back to the return-value assumption.
+        count_attempts = isinstance(self.emitter, SafeLokiEmitter)
+        attempts_before = self.emitter.post_attempts if count_attempts else 0
+
+        try:
+            self.emitter.emit_batch(batch)
+        except Exception:
+            self._note_push_failure(len(records))
+            self._report_batch_failure(len(records))
+            return
+
+        if count_attempts and self.emitter.post_attempts == attempts_before:
+            self._note_push_failure(len(records))
+            self._report_batch_failure(
+                len(records),
+                reason="Push was SKIPPED without being sent (emitter lock held by "
+                       "another thread). The batch buffer is cleared regardless, so "
+                       "these records are lost.",
+            )
+            return
+
+        self._note_push_success()
+
+    def handleError(self, record: Union[logging.LogRecord, BaseException]) -> None:
         """Handle errors during emit() by printing to stderr instead of logging.
 
         This prevents recursive loops where Loki handler errors would be logged
         through the same Loki handler, causing infinite recursion.
+
+        Accepts an Exception as well as a LogRecord: upstream LokiHandler calls
+        handleError(exc) from its own emit/emit_batch, so an inherited code path
+        can hand us either. The getattr fallbacks below cover both.
         """
         if sys.meta_path is None:
             return
@@ -102,8 +346,14 @@ class SafeLokiHandler(logging_loki.LokiHandler):
         print("=" * 60, file=sys.stderr)
 
         try:
+            # getMessage() exists on LogRecord but not on an Exception, and can
+            # itself raise on a malformed record (bad %-args).
+            get_message = getattr(record, 'getMessage', None)
             try:
-                message = record.getMessage()
+                if callable(get_message):
+                    message = get_message()
+                else:
+                    message = str(record)
             except Exception:
                 message = getattr(record, 'msg', '<unavailable>')
             print(f"Original log: {message}", file=sys.stderr)
@@ -189,10 +439,18 @@ class SafeLokiBatchHandler(LokiBatchHandler):
         while not self._timer_stop.wait(self.interval):
             try:
                 self.flush()
-            except Exception:
-                # flush failures surface via SafeLokiHandler.handleError /
-                # the waylay.loglog logger; never let the timer thread die.
-                pass
+            except Exception as e:
+                # Push failures are reported by SafeLokiHandler.emit_batch, which
+                # is where they actually surface. Anything reaching here is a
+                # failure of the flush machinery itself (never seen in practice)
+                # and would otherwise be invisible, so say so — but never let the
+                # timer thread die, or batching stops for the process lifetime.
+                if sys.meta_path is not None:
+                    print(
+                        f"LOKI HANDLER ERROR: batch flush timer raised "
+                        f"{type(e).__name__}: {e}",
+                        file=sys.stderr,
+                    )
 
     def stop_timer(self) -> None:
         """Stop the background flush timer. Idempotent and safe after close()."""
@@ -226,10 +484,16 @@ class SafeLokiQueueHandler(logging.handlers.QueueHandler):
 
     handler: Union[SafeLokiBatchHandler, SafeLokiHandler]
 
-    def __init__(self, queue: Queue, batch_interval: Optional[float] = None, **kwargs) -> None:
+    def __init__(
+        self,
+        queue: Queue,
+        batch_interval: Optional[float] = None,
+        push_timeout: float = DEFAULT_PUSH_TIMEOUT,
+        **kwargs,
+    ) -> None:
         super().__init__(queue)
         self.enqueued_count: int = 0
-        loki_handler = SafeLokiHandler(**kwargs)
+        loki_handler = SafeLokiHandler(push_timeout=push_timeout, **kwargs)
         if batch_interval:
             self.handler = SafeLokiBatchHandler(batch_interval, target=loki_handler)
         else:
@@ -244,9 +508,15 @@ class SafeLokiQueueHandler(logging.handlers.QueueHandler):
 
     def get_diagnostics(self) -> dict:
         """Return diagnostic info about this handler's state."""
+        target = self.handler
+        if isinstance(target, SafeLokiBatchHandler):
+            target = target.target
         return {
             "enqueued_count": self.enqueued_count,
             "queue_size": self.queue.qsize(),
+            "push_success_count": getattr(target, "push_success_count", 0),
+            "consecutive_failures": getattr(target, "consecutive_failures", 0),
+            "records_dropped": getattr(target, "records_dropped", 0),
         }
 
     def flush(self) -> None:
@@ -463,11 +733,13 @@ def _create_loki_handler(
     ca_bundle_path: str,
     json_format: bool,
     batch_interval: Optional[float],
+    push_timeout: float,
 ) -> SafeLokiQueueHandler:
     """Create an async queue-based Loki handler with the appropriate formatter."""
     handler = SafeLokiQueueHandler(
         Queue(-1),
         batch_interval=batch_interval,
+        push_timeout=push_timeout,
         url=endpoint,
         tags={"application": application_tag},
         auth=(user, password),
@@ -518,7 +790,8 @@ def configure_logging(
     debug_local: bool = False,
     local_level: Union[int, str] = logging.INFO,
     json_format: bool = True,
-    batch_interval: Optional[float] = 1.0
+    batch_interval: Optional[float] = 1.0,
+    push_timeout: float = DEFAULT_PUSH_TIMEOUT
 ) -> Optional[logging.Handler]:
     """Configure logging for the application with Loki integration or local stdout.
 
@@ -547,16 +820,30 @@ def configure_logging(
             goes idle. Pass None or 0 to disable batching entirely and ship each
             record immediately — useful for low-volume alerting/ingest services
             where latency matters more than POST count.
+        push_timeout: Seconds any single POST to Loki may take before it is
+            abandoned (default: 10.0). Must be > 0. logging_loki itself passes
+            no timeout, which lets a black-holed endpoint hang the flush thread
+            forever and silently wedge the whole pipeline; this bounds it.
 
     Returns:
         SafeLokiQueueHandler if Loki connection succeeds, None if using stdout fallback
 
     Raises:
-        ValueError: If application_tag is empty
+        ValueError: If application_tag is empty, or push_timeout is not > 0
         RuntimeError: If required environment variables are missing (non-debug mode only)
     """
     if not application_tag:
         raise ValueError("application_tag must be set")
+
+    # Validated here rather than only in SafeLokiHandler: the handler is built
+    # after the connection test, so a bad value would raise in production (Loki
+    # up) but silently take the stdout-fallback path in dev/CI (Loki down) and
+    # ship undetected.
+    if push_timeout <= 0:
+        raise ValueError(
+            f"push_timeout must be > 0, got {push_timeout!r}; an unbounded "
+            "POST can wedge the logging pipeline permanently."
+        )
 
     # Reconfigure (SIGHUP, per-worker init, tests) may replace an existing Loki
     # handler. Clearing root.handlers alone would orphan the previous handler's
@@ -579,7 +866,8 @@ def configure_logging(
         return None
 
     handler = _create_loki_handler(
-        application_tag, endpoint, user, password, ca_bundle_path, json_format, batch_interval
+        application_tag, endpoint, user, password, ca_bundle_path, json_format,
+        batch_interval, push_timeout
     )
 
     root_logger = logging.getLogger()

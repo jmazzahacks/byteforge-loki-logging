@@ -92,6 +92,54 @@ endpoint, error, and a hint about the `/loki/api/v1/push` path). Your
 application never crashes due to logging issues, but operators are explicitly
 told that logs are not reaching Loki.
 
+### Delivery failures are loud
+
+Startup is not the only way Loki delivery breaks. An endpoint that is healthy at
+`configure_logging()` time and fails later — cut over to a new host, black-holed
+by a route change, returning 5xx — fails on the *steady-state push* path instead.
+
+Failed pushes print a `LOKI HANDLER ERROR` banner to stderr (rate-limited — see
+below) naming how many records were dropped, how long the failure has been going
+on, and whether the handler has **ever** successfully delivered a batch (the
+"this service has been silent since boot and nobody noticed" case):
+
+```
+============================================================
+LOKI HANDLER ERROR: Failed to send log batch to Loki
+============================================================
+Records dropped this batch: 3
+Consecutive failed pushes: 4 (total records dropped: 9)
+Loki delivery has been failing repeatedly. Logs queried from Loki for this
+service are INCOMPLETE for this period.
+```
+
+Banners are rate-limited to the 1st, 2nd, 4th, 8th ... consecutive failure — on
+both the batched and the `batch_interval=None` path — so a wedged endpoint
+reports continuously without burying real errors. The handler closes its HTTP
+session after each failure, so it **reconnects and resumes on its own** once the
+endpoint recovers — no restart required.
+
+Every POST is bounded by `push_timeout` (default 10s). Note this is `requests`'
+timeout, which applies per socket operation rather than as a total deadline, so a
+slow-trickle endpoint can still exceed it overall. It matters more than it
+sounds: `logging_loki` itself passes no timeout, so an endpoint that accepts the
+connection and never answers parks the flush thread inside that POST forever,
+blocks the queue listener behind it, and silently stops shipping for the life of
+the process.
+
+Counters are available for health checks and diagnostics:
+
+```python
+handler = configure_logging(application_tag="my-service")
+if handler:
+    handler.get_diagnostics()
+    # {'enqueued_count': 1043, 'queue_size': 0, 'push_success_count': 87,
+    #  'consecutive_failures': 0, 'records_dropped': 0}
+```
+
+A non-zero `consecutive_failures`, or a `push_success_count` of `0` on a service
+that has been running a while, means logs queried from Loki are incomplete.
+
 ### Short-Lived Processes (CLI / cron jobs)
 
 The async queue means a process can exit before the background listener has
@@ -116,7 +164,7 @@ finally:
 
 ## API
 
-### `configure_logging(application_tag, debug_local=False, local_level=logging.INFO, json_format=True, batch_interval=1.0)`
+### `configure_logging(application_tag, debug_local=False, local_level=logging.INFO, json_format=True, batch_interval=1.0, push_timeout=10.0)`
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -125,6 +173,7 @@ finally:
 | `local_level` | `int \| str` | `logging.INFO` | Logging level (e.g. `logging.DEBUG`, `"WARNING"`) |
 | `json_format` | `bool` | `True` | Use JSON formatting for structured queries |
 | `batch_interval` | `float \| None` | `1.0` | Seconds between batched POSTs, flushed on a background timer. `None`/`0` disables batching (ship each record immediately) |
+| `push_timeout` | `float` | `10.0` | Max seconds any single POST to Loki may take. Must be > 0 — see [Delivery failures](#delivery-failures-are-loud) |
 
 Returns `SafeLokiQueueHandler` on success, `None` on fallback/local mode.
 

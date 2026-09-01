@@ -17,6 +17,7 @@ import byteforge_loki_logging.logging_config as cfg_module
 from byteforge_loki_logging.logging_config import (
     LokiJsonFormatter,
     SafeLokiBatchHandler,
+    SafeLokiEmitter,
     SafeLokiHandler,
     SafeLokiQueueHandler,
     _resolve_log_level,
@@ -884,3 +885,325 @@ class TestFlushLogging:
         with patch.dict("os.environ", _env_vars(), clear=True), patch("sys.stderr", captured):
             configure_logging("myapp")
         mock_register.assert_not_called()
+
+
+# ===========================================================================
+# Push timeout — the black-holed-endpoint wedge (ticket 4c196404)
+# ===========================================================================
+
+class TestSafeLokiEmitterTimeout:
+    """logging_loki's LokiEmitter posts with no timeout, so a black-holed
+    endpoint hangs the flush thread forever and silently wedges the whole
+    pipeline. SafeLokiEmitter bounds every POST."""
+
+    def _make_emitter(self, timeout: float = 10.0) -> SafeLokiEmitter:
+        emitter = SafeLokiEmitter("http://loki/loki/api/v1/push")
+        emitter.push_timeout = timeout
+        return emitter
+
+    def test_post_passes_timeout_to_session(self) -> None:
+        emitter = self._make_emitter(timeout=3.5)
+        session = MagicMock()
+        session.post.return_value = MagicMock(status_code=204)
+        emitter._session = session
+
+        emitter._post_to_loki({"streams": []})
+
+        assert session.post.call_args.kwargs["timeout"] == 3.5
+
+    def test_post_raises_on_non_success_status(self) -> None:
+        emitter = self._make_emitter()
+        session = MagicMock()
+        session.post.return_value = MagicMock(status_code=503)
+        emitter._session = session
+
+        with pytest.raises(ValueError, match="503"):
+            emitter._post_to_loki({"streams": []})
+
+    @patch("byteforge_loki_logging.logging_config.logging_loki.LokiHandler.__init__", return_value=None)
+    def test_handler_rejects_non_positive_timeout(self, mock_init: MagicMock) -> None:
+        with pytest.raises(ValueError, match="push_timeout must be > 0"):
+            SafeLokiHandler(push_timeout=0, url="http://loki")
+
+    def test_configure_logging_rejects_non_positive_timeout(self) -> None:
+        with patch.dict("os.environ", _env_vars(), clear=True), \
+                patch("byteforge_loki_logging.logging_config._test_loki_connection",
+                      return_value=(True, "")):
+            with pytest.raises(ValueError, match="push_timeout must be > 0"):
+                configure_logging("myapp", push_timeout=-1)
+
+    def test_configure_logging_rejects_bad_timeout_even_when_loki_is_down(self) -> None:
+        """Validated before the connection test, so an invalid value cannot pass
+        silently in dev/CI (stdout fallback) and only blow up in production."""
+        with patch.dict("os.environ", _env_vars(), clear=True), \
+                patch("byteforge_loki_logging.logging_config._test_loki_connection",
+                      return_value=(False, "connection refused")), \
+                patch("sys.stderr", StringIO()):
+            with pytest.raises(ValueError, match="push_timeout must be > 0"):
+                configure_logging("myapp", push_timeout=0)
+
+
+# ===========================================================================
+# Push failures must be visible and must not wedge the handler
+# ===========================================================================
+
+class TestPushFailureVisibility:
+
+    @patch("byteforge_loki_logging.logging_config.logging_loki.LokiHandler.__init__", return_value=None)
+    def _make_handler(self, mock_init: MagicMock) -> SafeLokiHandler:
+        handler = SafeLokiHandler.__new__(SafeLokiHandler)
+        handler.emitter = MagicMock()
+        handler.format = MagicMock(return_value="formatted")
+        handler.consecutive_failures = 0
+        handler.push_success_count = 0
+        handler.records_dropped = 0
+        return handler
+
+    def test_failed_batch_prints_banner_naming_records_lost(self) -> None:
+        handler = self._make_handler()
+        handler.emitter.emit_batch.side_effect = ConnectionError("endpoint down")
+        captured = StringIO()
+
+        with patch("sys.stderr", captured):
+            handler.emit_batch([_make_record(), _make_record(), _make_record()])
+
+        out = captured.getvalue()
+        assert "LOKI HANDLER ERROR" in out
+        assert "Records dropped this batch: 3" in out
+        assert handler.records_dropped == 3
+        assert handler.consecutive_failures == 1
+
+    def test_failed_batch_closes_emitter_so_next_attempt_reconnects(self) -> None:
+        """Without this the handler reuses a dead session forever and only a
+        container restart recovers it."""
+        handler = self._make_handler()
+        handler.emitter.emit_batch.side_effect = ConnectionError("endpoint down")
+
+        with patch("sys.stderr", StringIO()):
+            handler.emit_batch([_make_record()])
+
+        handler.emitter.close.assert_called_once()
+
+    def test_never_shipped_anything_is_called_out_explicitly(self) -> None:
+        handler = self._make_handler()
+        handler.emitter.emit_batch.side_effect = ConnectionError("endpoint down")
+        captured = StringIO()
+
+        with patch("sys.stderr", captured):
+            handler.emit_batch([_make_record()])
+
+        assert "NEVER successfully delivered" in captured.getvalue()
+
+    def test_success_resets_failure_streak(self) -> None:
+        handler = self._make_handler()
+        handler.consecutive_failures = 7
+
+        handler.emit_batch([_make_record()])
+
+        assert handler.consecutive_failures == 0
+        assert handler.push_success_count == 1
+
+    def test_repeated_failures_are_rate_limited_not_one_banner_each(self) -> None:
+        """A wedged endpoint fails every interval; unthrottled banners bury
+        real errors. Reports land on failures 1, 2, 4, 8, 16."""
+        handler = self._make_handler()
+        handler.emitter.emit_batch.side_effect = ConnectionError("endpoint down")
+        captured = StringIO()
+
+        with patch("sys.stderr", captured):
+            for _ in range(20):
+                handler.emit_batch([_make_record()])
+
+        assert captured.getvalue().count("LOKI HANDLER ERROR") == 5
+        assert handler.consecutive_failures == 20
+        assert handler.records_dropped == 20
+
+    def test_sustained_failure_warns_that_loki_data_is_incomplete(self) -> None:
+        handler = self._make_handler()
+        handler.push_success_count = 1     # has shipped before, so not the "never" case
+        handler.emitter.emit_batch.side_effect = ConnectionError("endpoint down")
+        captured = StringIO()
+
+        with patch("sys.stderr", captured):
+            for _ in range(4):
+                handler.emit_batch([_make_record()])
+
+        assert "INCOMPLETE" in captured.getvalue()
+
+    def test_single_record_failure_prints_exactly_one_banner(self) -> None:
+        """The non-batching path (batch_interval=None) reports via handleError.
+        Counting and reporting are split so it does not also print a batch
+        banner — two banners per dropped line is noise, not signal."""
+        handler = self._make_handler()
+        handler.emitter.side_effect = ConnectionError("endpoint down")
+        captured = StringIO()
+
+        with patch("sys.stderr", captured):
+            handler.emit(_make_record())
+
+        assert captured.getvalue().count("LOKI HANDLER ERROR") == 1
+        # ...and the failure is still accounted for and the session dropped.
+        assert handler.consecutive_failures == 1
+        assert handler.records_dropped == 1
+        handler.emitter.close.assert_called_once()
+
+    def test_single_record_failures_are_rate_limited_too(self) -> None:
+        """The batch_interval=None path prints a banner AND a full traceback, so
+        an unreachable endpoint there was 10 banners for 10 log lines."""
+        handler = self._make_handler()
+        handler.emitter.side_effect = ConnectionError("endpoint down")
+        captured = StringIO()
+
+        with patch("sys.stderr", captured):
+            for _ in range(20):
+                handler.emit(_make_record())
+
+        assert captured.getvalue().count("LOKI HANDLER ERROR") == 5
+        assert handler.consecutive_failures == 20
+
+    def test_formatter_error_is_not_reported_as_a_loki_outage(self) -> None:
+        """A formatter bug must not increment delivery counters or tear down a
+        healthy HTTP session — operators would get an outage banner for it."""
+        handler = self._make_handler()
+        handler.format = MagicMock(side_effect=ValueError("bad format string"))
+
+        with patch("sys.stderr", StringIO()):
+            handler.emit(_make_record())
+            handler.emit_batch([_make_record(), _make_record()])
+
+        assert handler.consecutive_failures == 0
+        assert handler.records_dropped == 0
+        handler.emitter.close.assert_not_called()
+        handler.emitter.emit_batch.assert_not_called()
+
+    def test_skipped_push_is_not_counted_as_a_delivery(self) -> None:
+        """logging_loki wraps the emitter in @with_lock, which returns WITHOUT
+        posting when the lock is held. A clean return is not proof of delivery,
+        and the batch buffer is cleared either way."""
+        handler = SafeLokiHandler(url="http://loki.test/loki/api/v1/push")
+        handler.emitter._session = MagicMock()
+        captured = StringIO()
+
+        # Hold the emitter lock exactly as a concurrent caller would.
+        handler.emitter._lock.acquire()
+        try:
+            with patch("sys.stderr", captured):
+                handler.emit_batch([_make_record(), _make_record(), _make_record()])
+        finally:
+            handler.emitter._lock.release()
+
+        assert handler.push_success_count == 0
+        assert handler.records_dropped == 3
+        assert "SKIPPED" in captured.getvalue()
+
+    def test_successful_batch_counts_attempts_and_reports_delivery(self) -> None:
+        handler = SafeLokiHandler(url="http://loki.test/loki/api/v1/push")
+        session = MagicMock()
+        session.post.return_value = MagicMock(status_code=204)
+        handler.emitter._session = session
+
+        handler.emit_batch([_make_record(), _make_record()])
+
+        assert handler.push_success_count == 1
+        assert handler.records_dropped == 0
+        assert handler.emitter.post_attempts == 1
+
+    def test_push_timeout_is_keyword_only_so_a_positional_url_still_works(self) -> None:
+        """SafeLokiHandler("https://loki/...") must not land the URL in
+        push_timeout and raise an unrelated TypeError."""
+        handler = SafeLokiHandler("http://loki.test/loki/api/v1/push")
+        assert handler.emitter.url == "http://loki.test/loki/api/v1/push"
+        assert handler.emitter.push_timeout == 10.0
+
+    def test_handle_error_accepts_an_exception_not_just_a_record(self) -> None:
+        """Upstream LokiHandler calls handleError(exc); inherited paths can
+        hand us either shape."""
+        handler = self._make_handler()
+        captured = StringIO()
+
+        with patch("sys.stderr", captured):
+            handler.handleError(ConnectionError("boom"))
+
+        assert "LOKI HANDLER ERROR" in captured.getvalue()
+
+
+# ===========================================================================
+# End-to-end regression: a hung endpoint must not wedge the pipeline
+# ===========================================================================
+
+class TestHungEndpointDoesNotWedgePipeline:
+
+    def test_queue_drains_and_handler_recovers_without_restart(self) -> None:
+        """Regression for ticket 4c196404: pre-fix this delivered 0 records,
+        left the queue growing, printed nothing, and never recovered."""
+        import os
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        captured_bodies: list[str] = []
+        healed = threading.Event()
+
+        class Catcher(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args: Any) -> None:
+                pass
+
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Length", "5")
+                self.end_headers()
+                self.wfile.write(b"ready")
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length).decode()
+                if not healed.is_set():
+                    healed.wait(10)      # black hole: accept, never answer
+                    return
+                captured_bodies.append(body)
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Catcher)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+        env = {
+            "LOKI_ENDPOINT": f"http://127.0.0.1:{port}/loki/api/v1/push",
+            "LOKI_USER": "u",
+            "LOKI_PASSWORD": "p",
+            "LOKI_CA_BUNDLE_PATH": "false",
+        }
+        root = logging.getLogger()
+        saved_handlers = list(root.handlers)
+        handler = None
+        try:
+            with patch.dict(os.environ, env, clear=True), patch("sys.stderr", StringIO()):
+                handler = configure_logging(
+                    "wedge-test", batch_interval=0.2, push_timeout=0.5
+                )
+                log = logging.getLogger("wedge.test")
+
+                log.info("DEAD-1")
+                time.sleep(1.5)          # POST times out instead of hanging forever
+
+                healed.set()
+                for i in range(3):
+                    log.info(f"ALIVE-{i}")
+                time.sleep(1.5)
+
+                diagnostics = handler.get_diagnostics()
+        finally:
+            if handler is not None:
+                flush_logging(timeout=2.0)
+            server.shutdown()
+            root.handlers = saved_handlers
+
+        # The pipeline kept moving: nothing stranded in the queue...
+        assert diagnostics["queue_size"] == 0
+        # ...the failure was counted rather than swallowed...
+        assert diagnostics["records_dropped"] >= 1
+        # ...and it resumed shipping with no restart.
+        assert diagnostics["push_success_count"] >= 1
+        assert any("ALIVE-" in body for body in captured_bodies)
