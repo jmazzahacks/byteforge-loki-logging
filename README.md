@@ -140,6 +140,31 @@ if handler:
 A non-zero `consecutive_failures`, or a `push_success_count` of `0` on a service
 that has been running a while, means logs queried from Loki are incomplete.
 
+### Connection handling (retries and fork safety)
+
+The emitter keeps a persistent HTTP session, which has two failure modes this
+library guards against:
+
+**Dropped keep-alive sockets.** A Loki behind nginx closes idle connections
+(`keepalive_timeout`). urllib3 discards a socket that was cleanly closed, so the
+problem is the race: the socket still looks alive when it is checked, the request
+goes out, and only then does the server hang up — surfacing as
+`RemoteDisconnected('Remote end closed connection without response')` and losing
+that batch. Pushes now carry a one-shot retry that opens a fresh connection.
+
+**Forked children.** `requests.Session` and urllib3's connection pools are not
+fork-safe. A process that has already pushed to Loki and then forks (a
+`multiprocessing` pool, an Optuna/joblib worker set) gives every child a session
+pointing at the *same* live socket, and they race on it — one simultaneous
+`RemoteDisconnected` per child. The session is now keyed to the PID that built
+it, so each process transparently gets its own on first use after a fork. This
+is the same guard psycopg2, SQLAlchemy and boto3 use.
+
+Both are automatic; there is nothing to configure. Note the retry means a batch
+could in principle be delivered twice if the server processed it and then dropped
+the socket — Loki drops exact duplicates, and duplicate log lines beat the
+silently lost batch this replaces.
+
 ### Short-Lived Processes (CLI / cron jobs)
 
 The async queue means a process can exit before the background listener has

@@ -1,6 +1,7 @@
 import json
 import logging
 import logging.handlers
+import os
 import sys
 import threading
 import time
@@ -906,6 +907,7 @@ class TestSafeLokiEmitterTimeout:
         session = MagicMock()
         session.post.return_value = MagicMock(status_code=204)
         emitter._session = session
+        emitter._session_pid = os.getpid()
 
         emitter._post_to_loki({"streams": []})
 
@@ -916,6 +918,7 @@ class TestSafeLokiEmitterTimeout:
         session = MagicMock()
         session.post.return_value = MagicMock(status_code=503)
         emitter._session = session
+        emitter._session_pid = os.getpid()
 
         with pytest.raises(ValueError, match="503"):
             emitter._post_to_loki({"streams": []})
@@ -1082,6 +1085,7 @@ class TestPushFailureVisibility:
         and the batch buffer is cleared either way."""
         handler = SafeLokiHandler(url="http://loki.test/loki/api/v1/push")
         handler.emitter._session = MagicMock()
+        handler.emitter._session_pid = os.getpid()
         captured = StringIO()
 
         # Hold the emitter lock exactly as a concurrent caller would.
@@ -1101,6 +1105,7 @@ class TestPushFailureVisibility:
         session = MagicMock()
         session.post.return_value = MagicMock(status_code=204)
         handler.emitter._session = session
+        handler.emitter._session_pid = os.getpid()
 
         handler.emit_batch([_make_record(), _make_record()])
 
@@ -1207,3 +1212,121 @@ class TestHungEndpointDoesNotWedgePipeline:
         # ...and it resumed shipping with no restart.
         assert diagnostics["push_success_count"] >= 1
         assert any("ALIVE-" in body for body in captured_bodies)
+
+
+# ===========================================================================
+# RemoteDisconnected: stale keep-alive sockets and fork safety (ticket ac3c6ccd)
+# ===========================================================================
+
+class TestStaleSocketRetry:
+    """A pooled socket the server closed is the reported RemoteDisconnected
+    burst. urllib3 already discards a cleanly FIN-ed socket, so the failure is
+    the race: it looks alive when checked, the request goes out, then the server
+    hangs up."""
+
+    def _dropping_server(self, drop_on: int = 2):
+        """Server that answers request 1 on a connection then hangs up on the
+        next one WITHOUT responding. Returns (port, shutdown)."""
+        from collections import defaultdict
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        per_conn: dict = defaultdict(int)
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args: Any) -> None:
+                pass
+
+            def do_POST(self) -> None:
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                key = id(self.connection)
+                per_conn[key] += 1
+                if per_conn[key] >= drop_on:
+                    self.close_connection = True
+                    return
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server.server_address[1], server.shutdown
+
+    def test_push_recovers_when_server_drops_the_pooled_socket(self) -> None:
+        port, shutdown = self._dropping_server()
+        try:
+            emitter = SafeLokiEmitter(f"http://127.0.0.1:{port}/loki/api/v1/push")
+            emitter.push_timeout = 5.0
+            emitter._post_to_loki({"streams": []})
+            # Pre-fix this raised ConnectionError(RemoteDisconnected) and the
+            # whole batch was lost.
+            emitter._post_to_loki({"streams": []})
+            assert emitter.post_attempts == 2
+        finally:
+            shutdown()
+
+    def test_retry_policy_treats_the_drop_as_a_read_error(self) -> None:
+        """Guards the non-obvious setting. urllib3 wraps RemoteDisconnected in
+        ProtocolError, which Retry._is_read_error counts as a READ error — so
+        the intuitive connect=1/read=0 declines the retry we need. Measured:
+        read=0 fails, read=1 recovers."""
+        from urllib3.exceptions import ProtocolError
+
+        from byteforge_loki_logging.logging_config import _PUSH_RETRY_POLICY
+
+        assert _PUSH_RETRY_POLICY._is_read_error(ProtocolError("Connection aborted."))
+        assert _PUSH_RETRY_POLICY.read == 1, "read=0 would not retry a dropped socket"
+        assert _PUSH_RETRY_POLICY.total == 1, "one retry only — pushes are not idempotent"
+
+    def test_session_mounts_the_retry_adapter_on_both_schemes(self) -> None:
+        emitter = SafeLokiEmitter("https://loki.test/loki/api/v1/push")
+        session = emitter.session
+        for scheme in ("http://", "https://"):
+            assert session.adapters[scheme].max_retries.read == 1
+
+
+class TestSessionIsForkSafe:
+    """requests.Session/urllib3 pools are not fork-safe: fork duplicates the
+    descriptor, so children of a process that has already pushed inherit a
+    session pointing at a LIVE socket and race on it. Reported signature was 16
+    simultaneous RemoteDisconnected, one per multiprocessing worker."""
+
+    def test_session_is_rebuilt_when_the_pid_changes(self) -> None:
+        emitter = SafeLokiEmitter("https://loki.test/loki/api/v1/push")
+        first = emitter.session
+        assert emitter.session is first, "same process must reuse its session"
+
+        # Simulate the child's view after a fork.
+        emitter._session_pid = os.getpid() - 1
+        second = emitter.session
+
+        assert second is not first
+        assert emitter._session_pid == os.getpid()
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork")
+    @pytest.mark.filterwarnings("ignore:This process.*is multi-threaded:DeprecationWarning")
+    def test_forked_child_does_not_share_the_parent_session(self) -> None:
+        emitter = SafeLokiEmitter("https://loki.test/loki/api/v1/push")
+        parent_session_id = id(emitter.session)
+
+        read_fd, write_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            # Child: touch the property only — no network, so this stays a test
+            # of the fork guard rather than of the platform's fork/TLS quirks.
+            os.close(read_fd)
+            shares = id(emitter.session) == parent_session_id
+            owned = emitter._session_pid == os.getpid()
+            os.write(write_fd, f"{int(shares)}{int(owned)}".encode())
+            os._exit(0)
+
+        os.close(write_fd)
+        result = os.read(read_fd, 8).decode()
+        os.close(read_fd)
+        os.waitpid(pid, 0)
+
+        assert result == "01", (
+            f"expected child to rebuild its own session (got {result!r}: "
+            "first digit=shared-with-parent, second=owned-by-child)"
+        )

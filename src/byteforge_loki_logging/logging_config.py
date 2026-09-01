@@ -12,9 +12,12 @@ from queue import Queue
 from typing import Any, List, Optional, Set, Tuple, Union
 
 import logging_loki
+import requests  # type: ignore[import-untyped]
 from logging.handlers import BufferingHandler
 from logging_loki.emitter import LokiEmitter  # type: ignore[import-untyped]
 from logging_loki.handlers import LokiBatchHandler
+from requests.adapters import HTTPAdapter  # type: ignore[import-untyped]
+from urllib3.util.retry import Retry
 
 
 _atexit_registered = False
@@ -22,6 +25,36 @@ _atexit_registered = False
 #: Seconds any single POST to Loki may take before it is abandoned. Bounded
 #: because logging_loki passes no timeout at all (see SafeLokiEmitter).
 DEFAULT_PUSH_TIMEOUT = 10.0
+
+#: One retry for a push that died on a connection the server had already closed.
+#:
+#: `read=1` is load-bearing and is NOT the obvious setting. urllib3 wraps
+#: `RemoteDisconnected` into `ProtocolError` (connectionpool.py), and
+#: `Retry._is_read_error` counts `ProtocolError` as a READ error, not a connect
+#: error — so the intuitive `connect=1, read=0` (safe-looking, because a read
+#: error can mean the server already processed the request) declines to retry
+#: exactly the failure we are here to fix. Measured against a server that drops
+#: a pooled keep-alive socket without responding: `connect=1, read=0` fails,
+#: `read=1` recovers.
+#:
+#: The idempotency cost is real but small: a retried batch could be delivered
+#: twice if the server processed the first attempt and then dropped the socket.
+#: Loki drops exact duplicates (same stream labels, same ns timestamp, same
+#: line), and our payload is byte-identical on retry because timestamps come
+#: from `record.created`, not from send time. Duplicate log lines would in any
+#: case be a better failure than the silently dropped batch this replaces.
+#: (A caller passing replace_timestamp=True to logging_loki gives up that
+#: dedup property — we never do.)
+_PUSH_RETRY_POLICY = Retry(
+    total=1,
+    connect=1,
+    read=1,
+    redirect=0,
+    status=0,
+    backoff_factor=0,
+    allowed_methods=frozenset(["POST"]),
+    raise_on_status=False,
+)
 
 
 # Standard LogRecord attributes that should not be treated as extra fields
@@ -100,6 +133,60 @@ class SafeLokiEmitter(LokiEmitter):
     #: SafeLokiHandler compares this across a call to tell the two apart, rather
     #: than scoring a silently-skipped push as a delivery.
     post_attempts: int = 0
+
+    #: PID that built the cached session. See the session property.
+    _session_pid: Optional[int] = None
+
+    #: Declared because logging_loki ships no type information, which otherwise
+    #: leaves the inherited attribute untyped for the session property below.
+    _session: Optional[requests.Session]
+
+    @property
+    def session(self) -> requests.Session:
+        """Return a session that is retry-capable and belongs to THIS process.
+
+        Two fixes over the upstream property, both for RemoteDisconnected bursts
+        seen on hyperopt-server (ticket ac3c6ccd):
+
+        1. Mounts a one-shot retry. Upstream mounts no HTTPAdapter, so
+           max_retries is 0 and a POST onto a pooled socket the server closed
+           while idle (nginx keepalive_timeout) fails outright, losing that
+           batch. urllib3 already discards a *cleanly* FIN-ed socket, so the
+           failure is the race: the socket still looks alive when urllib3 checks
+           it, the request goes out, and only then does the server hang up. One
+           retry opens a fresh connection. See _PUSH_RETRY_POLICY for why
+           `read=1` rather than the safer-looking `read=0`.
+
+        2. Keys the cached session to the PID. requests.Session/urllib3 pools
+           are not fork-safe: os.fork() duplicates the descriptor, so children
+           of a process that has already pushed inherit a session pointing at a
+           LIVE socket and all of them send and recv on it at once. The result
+           is protocol chaos and a simultaneous RemoteDisconnected in every
+           child — the reported signature was 16 failures inside ~15ms, one per
+           multiprocessing worker in an Optuna pool. Rebuilding per PID is the
+           same guard psycopg2, SQLAlchemy and boto3 use.
+        """
+        pid = os.getpid()
+        if self._session is not None and self._session_pid == pid:
+            return self._session
+
+        if self._session is not None:
+            # Inherited across a fork. Safe to close: fork duplicated the
+            # descriptor, so closing our copy does not FIN the parent's socket.
+            try:
+                self._session.close()
+            except Exception:
+                pass
+
+        session = self.session_class()
+        session.auth = self.auth or None
+        session.verify = self.verify
+        adapter = HTTPAdapter(max_retries=_PUSH_RETRY_POLICY)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        self._session = session
+        self._session_pid = pid
+        return session
 
     def _post_to_loki(self, payload: dict) -> None:
         """POST the payload with a bounded timeout (see class docstring)."""
@@ -623,8 +710,6 @@ def _test_loki_connection(
         Tuple of (success, error_message)
     """
     try:
-        import requests
-
         base_url = endpoint.replace("/loki/api/v1/push", "")
 
         response = requests.get(
