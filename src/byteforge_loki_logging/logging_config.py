@@ -52,6 +52,24 @@ if hasattr(os, "register_at_fork"):      # not available on Windows
 #: because logging_loki passes no timeout at all (see SafeLokiEmitter).
 DEFAULT_PUSH_TIMEOUT = 10.0
 
+#: Maximum records retained in the batch buffer during a transient HTTP outage.
+DEFAULT_MAX_BUFFER_SIZE = 1000
+
+
+class LokiPushError(ValueError):
+    """HTTP rejection with enough context to classify and diagnose a push."""
+
+    def __init__(self, status_code: int, body: str) -> None:
+        self.status_code = status_code
+        self.retryable = status_code in (408, 429) or 500 <= status_code < 600
+        # Bound and escape server output so HTML/error pages cannot swamp stderr
+        # or inject terminal control characters into the failure banner.
+        excerpt = ascii(body[:512])
+        super().__init__(
+            f"Unexpected Loki API response status code: {status_code}; response: {excerpt}"
+        )
+
+
 #: Retry a push exactly once when the connection was dropped before we got a
 #: response. Deliberately hand-rolled rather than a urllib3 Retry adapter, and
 #: the reason is worth keeping: urllib3 wraps `RemoteDisconnected` into
@@ -233,9 +251,7 @@ class SafeLokiEmitter(LokiEmitter):
             self.url, json=payload, headers=self.headers, timeout=self.push_timeout
         )
         if resp.status_code != self.success_response_code:
-            raise ValueError(
-                f"Unexpected Loki API response status code: {resp.status_code}"
-            )
+            raise LokiPushError(resp.status_code, resp.text)
 
 
 class SafeLokiHandler(logging_loki.LokiHandler):
@@ -338,7 +354,9 @@ class SafeLokiHandler(logging_loki.LokiHandler):
         except Exception:
             pass
 
-    def _report_batch_failure(self, records_lost: int, reason: str = "") -> None:
+    def _report_batch_failure(
+        self, records_lost: int, reason: str = "", records_retained: int = 0
+    ) -> None:
         """Print a loud, rate-limited banner for a failed batch push to Loki."""
         if not self._should_report_failure():
             return
@@ -351,6 +369,8 @@ class SafeLokiHandler(logging_loki.LokiHandler):
         if reason:
             print(reason, file=sys.stderr)
         print(f"Records dropped this batch: {records_lost}", file=sys.stderr)
+        if records_retained:
+            print(f"Records retained for retry: {records_retained}", file=sys.stderr)
         print(
             f"Consecutive failed pushes: {self.consecutive_failures} "
             f"(total records dropped: {self.records_dropped})",
@@ -408,12 +428,20 @@ class SafeLokiHandler(logging_loki.LokiHandler):
         else:
             self._note_push_success()
 
-    def emit_batch(self, records: List[logging.LogRecord]) -> None:
+    def emit_batch(
+        self, records: List[logging.LogRecord], *, retry_transient: bool = False
+    ) -> bool:
         """Send a batch of records, reporting failures instead of swallowing them.
 
         Upstream's emit_batch routes the exception into handleError and returns
         normally, so LokiBatchHandler.flush() clears the buffer and the loss is
         invisible. Here the failure is counted and announced.
+
+        A SafeLokiBatchHandler opts into retry_transient and owns accounting for
+        transient HTTP errors, which propagate to it for retention. Other callers
+        retain the original report-and-drop behavior because they have no buffer.
+        Return True only on delivery, so a backlog flush can stop after a failed
+        push instead of spending a separate push_timeout on every queued batch.
 
         Deliberately NOT wrapped in logging_loki's @with_original_stdout, unlike
         the method it overrides. That decorator pins output to the stderr that
@@ -429,7 +457,7 @@ class SafeLokiHandler(logging_loki.LokiHandler):
             # A formatter bug is not a Loki outage (see emit). An empty batch
             # cannot raise here, so records[0] is always present.
             self.handleError(records[0])
-            return
+            return False
 
         # @with_lock returns without posting when the emitter is busy, so a clean
         # return does not prove delivery. Only SafeLokiEmitter counts attempts;
@@ -439,10 +467,16 @@ class SafeLokiHandler(logging_loki.LokiHandler):
 
         try:
             self.emitter.emit_batch(batch)
+        except LokiPushError as exc:
+            if retry_transient and exc.retryable:
+                raise
+            self._note_push_failure(len(records))
+            self._report_batch_failure(len(records))
+            return False
         except Exception:
             self._note_push_failure(len(records))
             self._report_batch_failure(len(records))
-            return
+            return False
 
         if count_attempts and self.emitter.post_attempts == attempts_before:
             self._note_push_failure(len(records))
@@ -452,9 +486,10 @@ class SafeLokiHandler(logging_loki.LokiHandler):
                        "another thread). The batch buffer is cleared regardless, so "
                        "these records are lost.",
             )
-            return
+            return False
 
         self._note_push_success()
+        return True
 
     def handleError(self, record: Union[logging.LogRecord, BaseException]) -> None:
         """Handle errors during emit() by printing to stderr instead of logging.
@@ -534,9 +569,15 @@ class SafeLokiBatchHandler(LokiBatchHandler):
        handler while the process keeps running, so the timer must survive too.
        See the diagnostic trail in mcp-gatekeeper v0.5.5 for how this
        manifests in production.
+
+    Transient HTTP rejections retain records in a bounded buffer for a later
+    interval. Only begin_shutdown() disables retention; close() must preserve
+    retry behavior for the same dictConfig reason as the timer above.
     """
 
-    def __init__(self, interval: float, **kwargs) -> None:
+    def __init__(
+        self, interval: float, *, max_buffer_size: int = DEFAULT_MAX_BUFFER_SIZE, **kwargs: Any
+    ) -> None:
         if interval is None or interval <= 0:
             # wait(0) would hot-spin the timer thread; wait(None) would block it
             # forever (reintroducing the stranded-records bug). Batching needs a
@@ -547,7 +588,19 @@ class SafeLokiBatchHandler(LokiBatchHandler):
                 f"SafeLokiBatchHandler interval must be > 0, got {interval!r}; "
                 "pass batch_interval=None to configure_logging() to disable batching."
             )
+        if (
+            not isinstance(max_buffer_size, int)
+            or isinstance(max_buffer_size, bool)
+            or max_buffer_size <= 0
+        ):
+            raise ValueError("max_buffer_size must be a positive integer")
         super().__init__(interval, **kwargs)
+        self.max_buffer_size = max_buffer_size
+        self._retry_at = 0.0
+        self._shutting_down = False
+        self._shutdown_failed = False
+        self._shutdown_dropped = 0
+        self._overflow_count = 0
         self._timer_stop = threading.Event()
         self._flush_timer = threading.Thread(
             target=self._periodic_flush,
@@ -555,6 +608,111 @@ class SafeLokiBatchHandler(LokiBatchHandler):
             daemon=True,
         )
         self._flush_timer.start()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Keep oldest buffered records and discard new arrivals at the limit."""
+        self.acquire()
+        try:
+            if self._shutdown_failed:
+                self._discard_on_shutdown(1)
+                return
+            if len(self.buffer) >= self.max_buffer_size:
+                # Give a recovered endpoint a chance before discarding arrivals.
+                # flush() enforces the cooldown even when the buffer is full.
+                self.flush()
+                if self._shutdown_failed:
+                    self._discard_on_shutdown(1)
+                    return
+            if len(self.buffer) >= self.max_buffer_size:
+                self._overflow_count += 1
+                if isinstance(self.target, SafeLokiHandler):
+                    self.target.records_dropped += 1
+                n = self._overflow_count
+                if (n & (n - 1)) == 0 and sys.meta_path is not None:
+                    print(
+                        "LOKI HANDLER ERROR: batch buffer full; dropped newest record "
+                        f"(total overflow drops: {n}, limit: {self.max_buffer_size})",
+                        file=sys.stderr,
+                    )
+                return
+            super().emit(record)
+        finally:
+            self.release()
+
+    def flush(self) -> None:
+        """Retry transient HTTP failures no sooner than the next interval.
+
+        Preserve the oldest failed batch in place. Capacity remains the POST
+        batch size, while max_buffer_size bounds the retained backlog. All flush
+        triggers obey the cooldown, including ERROR records, full buffers, and
+        dictConfig's close(). Shutdown bypasses the cooldown for a final attempt
+        and discards any failure instead of scheduling another retry.
+        """
+        self.acquire()
+        try:
+            if self._shutdown_failed:
+                self._discard_on_shutdown(len(self.buffer))
+                self.buffer.clear()
+                return
+            if not self._shutting_down and time.time() < self._retry_at:
+                return
+            while self.target and self.buffer:
+                records = self.buffer[: max(1, self.capacity)]
+                delivered = True
+                if isinstance(self.target, SafeLokiHandler):
+                    try:
+                        delivered = self.target.emit_batch(records, retry_transient=True)
+                    except LokiPushError:
+                        retained = not self._shutting_down
+                        lost = 0 if retained else len(records)
+                        self.target._note_push_failure(lost)
+                        self.target._report_batch_failure(
+                            lost, records_retained=len(records) if retained else 0
+                        )
+                        if retained:
+                            self._retry_at = time.time() + self.interval
+                            return
+                        delivered = False
+                else:
+                    self.target.emit_batch(records)
+                del self.buffer[: len(records)]
+                self._retry_at = 0.0
+                if delivered is False:
+                    if self._shutting_down:
+                        self._shutdown_failed = True
+                        self._discard_on_shutdown(len(self.buffer))
+                        self.buffer.clear()
+                    else:
+                        # Failed records were already dropped. Delay attempts for
+                        # the remaining records, rather than holding the batch
+                        # lock through up to max_buffer_size/capacity timeouts.
+                        self._retry_at = time.time() + self.interval
+                    return
+        finally:
+            self._last_flush_time = time.time()
+            self.release()
+
+    def _discard_on_shutdown(self, count: int) -> None:
+        """Account for unsent backlog after the shutdown endpoint has failed."""
+        if not count:
+            return
+        previous = self._shutdown_dropped
+        self._shutdown_dropped += count
+        if isinstance(self.target, SafeLokiHandler):
+            self.target.records_dropped += count
+        if sys.meta_path is not None and (
+            previous == 0 or self._shutdown_dropped.bit_length() > previous.bit_length()
+        ):
+            print(
+                "LOKI HANDLER ERROR: shutdown push failed; discarded unsent records "
+                f"(total shutdown backlog drops: {self._shutdown_dropped})",
+                file=sys.stderr,
+            )
+
+    def begin_shutdown(self) -> None:
+        """Disable retention before draining, without waiting for an active POST."""
+        self._shutting_down = True
+        self.stop_timer()
 
     def _periodic_flush(self) -> None:
         """Flush buffered records every `interval` seconds until stopped.
@@ -568,9 +726,8 @@ class SafeLokiBatchHandler(LokiBatchHandler):
             try:
                 self.flush()
             except Exception as e:
-                # Push failures are reported by SafeLokiHandler.emit_batch, which
-                # is where they actually surface. Anything reaching here is a
-                # failure of the flush machinery itself (never seen in practice)
+                # Push failures are reported by flush()/SafeLokiHandler.emit_batch.
+                # Anything reaching here is a failure of the flush machinery itself
                 # and would otherwise be invisible, so say so — but never let the
                 # timer thread die, or batching stops for the process lifetime.
                 if sys.meta_path is not None:
@@ -617,13 +774,16 @@ class SafeLokiQueueHandler(logging.handlers.QueueHandler):
         queue: Queue,
         batch_interval: Optional[float] = None,
         push_timeout: float = DEFAULT_PUSH_TIMEOUT,
-        **kwargs,
+        max_buffer_size: int = DEFAULT_MAX_BUFFER_SIZE,
+        **kwargs: Any,
     ) -> None:
         super().__init__(queue)
         self.enqueued_count: int = 0
         loki_handler = SafeLokiHandler(push_timeout=push_timeout, **kwargs)
         if batch_interval:
-            self.handler = SafeLokiBatchHandler(batch_interval, target=loki_handler)
+            self.handler = SafeLokiBatchHandler(
+                batch_interval, target=loki_handler, max_buffer_size=max_buffer_size
+            )
         else:
             self.handler = loki_handler
         self.listener = logging.handlers.QueueListener(self.queue, self.handler)
@@ -645,6 +805,9 @@ class SafeLokiQueueHandler(logging.handlers.QueueHandler):
             "push_success_count": getattr(target, "push_success_count", 0),
             "consecutive_failures": getattr(target, "consecutive_failures", 0),
             "records_dropped": getattr(target, "records_dropped", 0),
+            "buffered_count": (
+                len(self.handler.buffer) if isinstance(self.handler, SafeLokiBatchHandler) else 0
+            ),
         }
 
     def flush(self) -> None:
@@ -652,13 +815,13 @@ class SafeLokiQueueHandler(logging.handlers.QueueHandler):
         self.handler.flush()
 
     def __del__(self) -> None:
+        inner = getattr(self, "handler", None)
+        if isinstance(inner, SafeLokiBatchHandler):
+            inner.begin_shutdown()
         try:
             self.listener.stop()
         except Exception:
             pass
-        inner = getattr(self, "handler", None)
-        if isinstance(inner, SafeLokiBatchHandler):
-            inner.stop_timer()
 
 
 def _collect_loki_queue_handlers() -> List[SafeLokiQueueHandler]:
@@ -701,16 +864,13 @@ def flush_logging(timeout: float = 5.0) -> bool:
 
     def _drain() -> None:
         for h in handlers:
+            inner = getattr(h, "handler", None)
+            if isinstance(inner, SafeLokiBatchHandler):
+                inner.begin_shutdown()
             try:
                 h.listener.stop()
             except Exception:
                 pass
-            inner = getattr(h, "handler", None)
-            if isinstance(inner, SafeLokiBatchHandler):
-                try:
-                    inner.stop_timer()
-                except Exception:
-                    pass
             try:
                 h.flush()
             except Exception:
@@ -860,12 +1020,14 @@ def _create_loki_handler(
     json_format: bool,
     batch_interval: Optional[float],
     push_timeout: float,
+    max_buffer_size: int,
 ) -> SafeLokiQueueHandler:
     """Create an async queue-based Loki handler with the appropriate formatter."""
     handler = SafeLokiQueueHandler(
         Queue(-1),
         batch_interval=batch_interval,
         push_timeout=push_timeout,
+        max_buffer_size=max_buffer_size,
         url=endpoint,
         tags={"application": application_tag},
         auth=(user, password),
@@ -917,7 +1079,8 @@ def configure_logging(
     local_level: Union[int, str] = logging.INFO,
     json_format: bool = True,
     batch_interval: Optional[float] = 1.0,
-    push_timeout: float = DEFAULT_PUSH_TIMEOUT
+    push_timeout: float = DEFAULT_PUSH_TIMEOUT,
+    max_buffer_size: int = DEFAULT_MAX_BUFFER_SIZE,
 ) -> Optional[logging.Handler]:
     """Configure logging for the application with Loki integration or local stdout.
 
@@ -950,16 +1113,23 @@ def configure_logging(
             abandoned (default: 10.0). Must be > 0. logging_loki itself passes
             no timeout, which lets a black-holed endpoint hang the flush thread
             forever and silently wedge the whole pipeline; this bounds it.
+        max_buffer_size: Maximum buffered records while batching (default: 1000).
+            HTTP 408/429/5xx batches are retained for a later interval. At the
+            limit, newest arrivals are dropped and counted. Does not bound the
+            asynchronous input queue or apply when batching is disabled.
 
     Returns:
         SafeLokiQueueHandler if Loki connection succeeds, None if using stdout fallback
 
     Raises:
-        ValueError: If application_tag is empty, or push_timeout is not > 0
+        ValueError: If application_tag is empty, push_timeout is not > 0,
+            or max_buffer_size is not a positive integer
         RuntimeError: If required environment variables are missing (non-debug mode only)
     """
     if not application_tag:
         raise ValueError("application_tag must be set")
+    if not isinstance(max_buffer_size, int) or isinstance(max_buffer_size, bool) or max_buffer_size <= 0:
+        raise ValueError("max_buffer_size must be a positive integer")
 
     # Validated here rather than only in SafeLokiHandler: the handler is built
     # after the connection test, so a bad value would raise in production (Loki
@@ -993,7 +1163,7 @@ def configure_logging(
 
     handler = _create_loki_handler(
         application_tag, endpoint, user, password, ca_bundle_path, json_format,
-        batch_interval, push_timeout
+        batch_interval, push_timeout, max_buffer_size
     )
 
     root_logger = logging.getLogger()

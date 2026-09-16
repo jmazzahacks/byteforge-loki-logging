@@ -119,6 +119,33 @@ reports continuously without burying real errors. The handler closes its HTTP
 session after each failure, so it **reconnects and resumes on its own** once the
 endpoint recovers — no restart required.
 
+With batching enabled, HTTP **408, 429, and 5xx** responses retain the failed
+records for a later flush, at least one `batch_interval` after the failure.
+Capacity-triggered flushes and ERROR logs obey that delay too. Retained records
+stay ahead of newer records and keep their original timestamps. Other HTTP
+errors (such as 400, 401, or 413) are dropped and reported. Connection retries
+and timeout handling remain as described below. With batching disabled, HTTP
+failures are dropped and reported because there is no retry buffer.
+
+`max_buffer_size` (default **1000** records) caps the batch backlog. When it is
+full, new arrivals are dropped and counted, preserving the oldest pending
+records. Overflow warnings are rate-limited. This limit applies to the batch
+buffer; the asynchronous input queue is still unbounded. Recovery sends the
+backlog in ordinary-sized batches instead of one oversized request.
+
+Failure banners include a bounded, escaped excerpt of Loki's response body
+(for example, `empty ring`) and distinguish retained records from dropped ones.
+`records_dropped` counts actual losses, including buffer overflow; retained
+records do not increment it. `flush_logging()` disables retention during its
+final drain: buffered records can be sent even during a retry delay. If a push
+fails during shutdown, the remaining backlog and subsequent queued arrivals
+are discarded and counted instead of making further network attempts.
+
+A failed push ends the current flush. During normal operation, any unsent
+records wait at least one `batch_interval` before another attempt, so a backlog
+cannot turn one flush into a long sequence of timeout-length requests. Records
+from a timed-out request are still dropped, not retried.
+
 Every POST is bounded by `push_timeout` (default 10s). Note this is `requests`'
 timeout, which applies per socket operation rather than as a total deadline, so a
 slow-trickle endpoint can still exceed it overall. It matters more than it
@@ -134,7 +161,7 @@ handler = configure_logging(application_tag="my-service")
 if handler:
     handler.get_diagnostics()
     # {'enqueued_count': 1043, 'queue_size': 0, 'push_success_count': 87,
-    #  'consecutive_failures': 0, 'records_dropped': 0}
+    #  'consecutive_failures': 0, 'records_dropped': 0, 'buffered_count': 0}
 ```
 
 A non-zero `consecutive_failures`, or a `push_success_count` of `0` on a service
@@ -205,7 +232,7 @@ finally:
 
 ## API
 
-### `configure_logging(application_tag, debug_local=False, local_level=logging.INFO, json_format=True, batch_interval=1.0, push_timeout=10.0)`
+### `configure_logging(application_tag, debug_local=False, local_level=logging.INFO, json_format=True, batch_interval=1.0, push_timeout=10.0, max_buffer_size=1000)`
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -215,6 +242,7 @@ finally:
 | `json_format` | `bool` | `True` | Use JSON formatting for structured queries |
 | `batch_interval` | `float \| None` | `1.0` | Seconds between batched POSTs, flushed on a background timer. `None`/`0` disables batching (ship each record immediately) |
 | `push_timeout` | `float` | `10.0` | Max seconds any single POST to Loki may take. Must be > 0 — see [Delivery failures](#delivery-failures-are-loud) |
+| `max_buffer_size` | `int` | `1000` | Maximum batch backlog; drops newest arrivals at the limit. Must be a positive integer. Unused when batching is disabled; does not bound the input queue |
 
 Returns `SafeLokiQueueHandler` on success, `None` on fallback/local mode.
 
