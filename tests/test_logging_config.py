@@ -49,6 +49,16 @@ def _make_record(**kwargs: Any) -> logging.LogRecord:
     return logging.LogRecord(**defaults)
 
 
+def _stub_loki_handler_init(self: logging.Handler, *args: Any, **kwargs: Any) -> None:
+    """Stand-in for LokiHandler.__init__ that still runs logging.Handler.__init__.
+
+    A bare return_value=None stub skips it, leaving no `filters`/`lock`, so a
+    record that reaches the handler on the QueueListener thread raises
+    AttributeError there (a PytestUnhandledThreadExceptionWarning, not a failure).
+    """
+    logging.Handler.__init__(self)
+
+
 def _env_vars() -> dict[str, str]:
     """Return a complete set of Loki environment variables."""
     return {
@@ -228,20 +238,22 @@ class TestSafeLokiQueueHandler:
         finally:
             handler.listener.stop()
 
-    @patch("byteforge_loki_logging.logging_config.logging_loki.LokiHandler.__init__", return_value=None)
-    def test_emit_enqueues_without_blocking(self, mock_init: MagicMock) -> None:
+    @patch("byteforge_loki_logging.logging_config.logging_loki.LokiHandler.__init__", new=_stub_loki_handler_init)
+    def test_emit_enqueues_without_blocking(self) -> None:
         queue = Queue(-1)
         handler = SafeLokiQueueHandler(queue, url="http://loki", tags={}, auth=("u", "p"))
+        handler.handler.emitter = MagicMock()
         try:
             record = _make_record()
             handler.emit(record)
         finally:
             handler.listener.stop()
 
-    @patch("byteforge_loki_logging.logging_config.logging_loki.LokiHandler.__init__", return_value=None)
-    def test_emit_increments_enqueued_count(self, mock_init: MagicMock) -> None:
+    @patch("byteforge_loki_logging.logging_config.logging_loki.LokiHandler.__init__", new=_stub_loki_handler_init)
+    def test_emit_increments_enqueued_count(self) -> None:
         queue = Queue(-1)
         handler = SafeLokiQueueHandler(queue, url="http://loki", tags={}, auth=("u", "p"))
+        handler.handler.emitter = MagicMock()
         try:
             assert handler.enqueued_count == 0
             handler.emit(_make_record())
@@ -251,10 +263,11 @@ class TestSafeLokiQueueHandler:
         finally:
             handler.listener.stop()
 
-    @patch("byteforge_loki_logging.logging_config.logging_loki.LokiHandler.__init__", return_value=None)
-    def test_get_diagnostics_returns_counts(self, mock_init: MagicMock) -> None:
+    @patch("byteforge_loki_logging.logging_config.logging_loki.LokiHandler.__init__", new=_stub_loki_handler_init)
+    def test_get_diagnostics_returns_counts(self) -> None:
         queue = Queue(-1)
         handler = SafeLokiQueueHandler(queue, url="http://loki", tags={}, auth=("u", "p"))
+        handler.handler.emitter = MagicMock()
         try:
             handler.emit(_make_record())
             diag = handler.get_diagnostics()
