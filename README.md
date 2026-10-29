@@ -66,6 +66,26 @@ than POST count, disable batching so each record ships immediately:
 configure_logging(application_tag="my-service", batch_interval=None)
 ```
 
+### Forking and Gunicorn workers
+
+Starting with **0.1.11**, logging configured before `os.fork()` can also be used
+in the child. The child gets an empty queue and batch buffer, fresh synchronization
+and HTTP session state, and starts its own listener/timer on its first log record.
+Pending parent records remain the parent's responsibility; children never replay
+them. The parent's logging pipeline continues unchanged.
+
+For Gunicorn, configure logging in the master if you need master logs, then call
+`configure_logging()` again in each worker's `post_fork` hook if it needs different
+settings or application tags. Child logs emitted before that hook are delivered
+through the child's inherited configuration and drained during reconfiguration.
+Gunicorn's named loggers must still route records to this handler (for example,
+through propagation to the root logger).
+
+Call `flush_logging()` during a graceful worker exit when needed; its timeout
+still applies. As with other asynchronous logging, forced exits such as SIGKILL
+or `os._exit()` cannot guarantee delivery of pending records. This support uses
+Python's `os.register_at_fork` hook; native forks that bypass it are not covered.
+
 ### Local Development
 
 ```python

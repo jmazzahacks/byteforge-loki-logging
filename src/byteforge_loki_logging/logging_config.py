@@ -24,6 +24,8 @@ _atexit_registered = False
 #: Every SafeLokiEmitter alive in this process, so a fork can reset them.
 #: Weak so an emitter belonging to a discarded handler is not kept alive.
 _LIVE_EMITTERS: "weakref.WeakSet[SafeLokiEmitter]" = weakref.WeakSet()
+_LIVE_BATCH_HANDLERS: "weakref.WeakSet[SafeLokiBatchHandler]" = weakref.WeakSet()
+_LIVE_QUEUE_HANDLERS: "weakref.WeakSet[SafeLokiQueueHandler]" = weakref.WeakSet()
 
 
 def _reset_emitters_after_fork() -> None:
@@ -45,8 +47,23 @@ def _reset_emitters_after_fork() -> None:
         emitter._session_pid = None
 
 
+def _reset_logging_after_fork() -> None:
+    """Discard parent work without touching inherited queue/event locks.
+
+    logging resets Handler locks itself before this callback. Ordinary Queue
+    and Event locks are not covered, and background threads do not survive a
+    fork. Reset every layer before returning to child application code. Threads
+    start lazily on the first child record, never inside the fork callback.
+    """
+    _reset_emitters_after_fork()
+    for handler in list(_LIVE_BATCH_HANDLERS):
+        handler._reset_after_fork()
+    for queue_handler in list(_LIVE_QUEUE_HANDLERS):
+        queue_handler._reset_after_fork()
+
+
 if hasattr(os, "register_at_fork"):      # not available on Windows
-    os.register_at_fork(after_in_child=_reset_emitters_after_fork)
+    os.register_at_fork(after_in_child=_reset_logging_after_fork)
 
 #: Seconds any single POST to Loki may take before it is abandoned. Bounded
 #: because logging_loki passes no timeout at all (see SafeLokiEmitter).
@@ -608,11 +625,31 @@ class SafeLokiBatchHandler(LokiBatchHandler):
             daemon=True,
         )
         self._flush_timer.start()
+        self._timer_needs_start = False
+        _LIVE_BATCH_HANDLERS.add(self)
+
+    def _reset_after_fork(self) -> None:
+        """Forget copied parent batches and replace inherited synchronization."""
+        self.buffer: List[logging.LogRecord] = []
+        self._retry_at = 0.0
+        self._last_flush_time = time.time()
+        self._shutting_down = False
+        self._shutdown_failed = False
+        self._shutdown_dropped = 0
+        self._overflow_count = 0
+        self._timer_stop = threading.Event()
+        self._flush_timer = threading.Thread(
+            target=self._periodic_flush, name="loki-batch-flush", daemon=True
+        )
+        self._timer_needs_start = True
 
     def emit(self, record: logging.LogRecord) -> None:
         """Keep oldest buffered records and discard new arrivals at the limit."""
         self.acquire()
         try:
+            if self._timer_needs_start and not self._shutting_down:
+                self._flush_timer.start()
+                self._timer_needs_start = False
             if self._shutdown_failed:
                 self._discard_on_shutdown(1)
                 return
@@ -767,6 +804,7 @@ class SafeLokiQueueHandler(logging.handlers.QueueHandler):
     Tracks the number of enqueued messages for diagnostics via get_diagnostics().
     """
 
+    queue: Queue[logging.LogRecord]
     handler: Union[SafeLokiBatchHandler, SafeLokiHandler]
 
     def __init__(
@@ -788,11 +826,34 @@ class SafeLokiQueueHandler(logging.handlers.QueueHandler):
             self.handler = loki_handler
         self.listener = logging.handlers.QueueListener(self.queue, self.handler)
         self.listener.start()
+        self._listener_needs_start = False
+        _LIVE_QUEUE_HANDLERS.add(self)
+
+    def _reset_after_fork(self) -> None:
+        """Replace the copied queue without draining or acquiring its mutex."""
+        self.queue = Queue(self.queue.maxsize)
+        self.listener = logging.handlers.QueueListener(self.queue, self.handler)
+        self._listener_needs_start = True
+        self.enqueued_count = 0
+        target = self.handler
+        if isinstance(target, SafeLokiBatchHandler):
+            target = target.target
+        if isinstance(target, SafeLokiHandler):
+            target.consecutive_failures = 0
+            target.push_success_count = 0
+            target.records_dropped = 0
 
     def emit(self, record: logging.LogRecord) -> None:
         """Enqueue a log record and increment the diagnostics counter."""
-        self.enqueued_count += 1
-        super().emit(record)
+        self.acquire()
+        try:
+            if self._listener_needs_start:
+                self.listener.start()
+                self._listener_needs_start = False
+            self.enqueued_count += 1
+            super().emit(record)
+        finally:
+            self.release()
 
     def get_diagnostics(self) -> dict:
         """Return diagnostic info about this handler's state."""
@@ -819,7 +880,8 @@ class SafeLokiQueueHandler(logging.handlers.QueueHandler):
         if isinstance(inner, SafeLokiBatchHandler):
             inner.begin_shutdown()
         try:
-            self.listener.stop()
+            if self.listener._thread is not None:
+                self.listener.stop()
         except Exception:
             pass
 
@@ -868,7 +930,11 @@ def flush_logging(timeout: float = 5.0) -> bool:
             if isinstance(inner, SafeLokiBatchHandler):
                 inner.begin_shutdown()
             try:
-                h.listener.stop()
+                # A forked child may never have emitted. Stopping an unstarted
+                # listener enqueues a sentinel without a consumer, and on older
+                # Python versions then raises while joining None.
+                if h.listener._thread is not None:
+                    h.listener.stop()
             except Exception:
                 pass
             try:
